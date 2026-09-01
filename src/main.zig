@@ -47,6 +47,12 @@ pub const MsgPackError = error {
     incomplete, // If you run out of bytes while parsing
 };
 
+// Next step: a read_object command that returns an updated buffer offset 
+// and a parsed object. It should return an incomplete error if it runs out of 
+// data to parse.
+// Unpack should call read object. This allows re-entrant behavior to handle 
+// nested objects like arrays and arrays of arrays.
+
 // Unpack the msgpack data to 
 pub fn unpack(allocator: std.mem.Allocator, input: []const u8) !MsgPackObject {
     // 94 00 = 1001 0100 0000 0000 
