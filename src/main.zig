@@ -31,6 +31,34 @@ pub fn main(init: std.process.Init) !void {
     try stdout_writer.flush(); // Don't forget to flush!
 }
 
+//// Unpacker implementation 
+
+pub fn Unpacker() type {
+    return struct {
+        const This = @This();
+        allocator: std.mem.Allocator, 
+        start: usize,
+        end: usize,
+        count: usize,
+        buffer: []u8,
+
+        pub fn init(allocator: std.mem.Allocator, bufferSize: usize) MsgPackError!This {
+            const buffer = try allocator.alloc(u8, bufferSize);
+            return This {
+                .allocator = allocator,
+                .start = 0,
+                .end = 0,
+                .count = 0,
+                .buffer = buffer,
+            };
+        }
+
+        pub fn deinit(this: *This) void {
+            this.buffer.free();
+        }
+    };
+}
+
 pub const MsgPackType = enum {
     array,
     integer,
@@ -45,6 +73,7 @@ pub const MsgPackObject = union(MsgPackType) {
 
 pub const MsgPackError = error {
     incomplete, // If you run out of bytes while parsing
+    outOfMemory,
 };
 
 // Next step: a read_object command that returns an updated buffer offset 
@@ -78,5 +107,10 @@ test "unpack command" {
     // Output [0, 1, 'nvim_eval', ['2 + 2']]
     const obj = try unpack(gpa, test_input);
     try std.testing.expect(obj == .array);
+    switch (obj) {
+        .array => gpa.free(obj.array),
+        else => {}
+    }
+
 }
 
