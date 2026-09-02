@@ -4,19 +4,12 @@ const Io = std.Io;
 const zig_msgpack = @import("zig_msgpack");
 
 pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-
-    // This is appropriate for anything that lives as long as the process.
     const arena: std.mem.Allocator = init.arena.allocator();
 
-    // Accessing command line arguments:
     const args = try init.minimal.args.toSlice(arena);
     for (args) |arg| {
         std.log.info("arg: {s}", .{arg});
     }
-
-    // In order to do I/O operations need an `Io` instance.
     const io = init.io;
 
     // Stdout is for the actual output of your application, for example if you
@@ -26,12 +19,15 @@ pub fn main(init: std.process.Init) !void {
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout_writer = &stdout_file_writer.interface;
 
-    try zig_msgpack.printAnotherMessage(stdout_writer);
+    _ = try stdout_writer.write("Hello, World!\n");
 
     try stdout_writer.flush(); // Don't forget to flush!
 }
 
 //// Unpacker implementation 
+
+const RingBuffer = zig_msgpack.RingBuffer;
+const RingBufferError = zig_msgpack.RingBufferError;
 
 pub const MsgPackType = enum {
     array,
@@ -45,73 +41,33 @@ pub const MsgPackObject = union(MsgPackType) {
     string: []u8,
 };
 
-pub const MsgPackError = error {
-    incomplete, // If you run out of bytes while parsing
-    outOfMemory,
-    noRoomInBuffer,
-    invalidBufferSize,
-};
+pub const MsgPackError = error{
+    Incomplete, // If you run out of bytes while parsing
+} || RingBufferError;
 
 pub const Unpacker = struct {
     pub const Options = struct {
         max_buffer_size: usize = 1024 * 1024, // 1MB default
     };
 
-    const This = @This();
-    allocator: std.mem.Allocator, 
-    start: usize,
-    end: usize,
-    count: usize,
-    buffer: []u8,
-    buffer_size: usize,
+    const Self = @This();
+    allocator: std.mem.Allocator,
+    ring: RingBuffer,
 
-    pub fn init(allocator: std.mem.Allocator, options: Options) MsgPackError!This {
-        if (options.max_buffer_size == 0) {
-            return MsgPackError.invalidBufferSize;
-        }
-        const buffer = allocator.alloc(u8, options.max_buffer_size) catch return MsgPackError.outOfMemory;
-        return This {
+    pub fn init(allocator: std.mem.Allocator, options: Options) MsgPackError!Self {
+        const ring = try RingBuffer.init(allocator, .{ .max_buffer_size = options.max_buffer_size });
+        return Self{
             .allocator = allocator,
-            .start = 0,
-            .end = 0,
-            .count = 0,
-            .buffer = buffer,
-            .buffer_size = options.max_buffer_size,
+            .ring = ring,
         };
     }
 
-    pub fn deinit(this: *This) void {
-        this.allocator.free(this.buffer);
+    pub fn deinit(self: *Self) void {
+        self.ring.deinit();
     }
 
-    pub fn feed(this: *This, data: []const u8) MsgPackError!void {
-        if (data.len == 0) {
-            return;
-        }
-
-        if (data.len > this.buffer_size - this.count) {
-            return MsgPackError.noRoomInBuffer;
-        }
-
-        // Since this is a ring buffer it will either fit in one go or we 
-        // need to fill to the end then do the rest at the beginning
-        const remaining_space = this.buffer_size - (this.end);
-        if (remaining_space < data.len) {
-            // Wrap
-            const left_over = data.len - remaining_space;
-            @memcpy(this.buffer[this.end..this.end + remaining_space], data[0..remaining_space]);
-            @memcpy(this.buffer[0..left_over], data[remaining_space..data.len]);
-            this.end = left_over;
-        } else {
-            // No wrap
-            @memcpy(this.buffer[this.end..this.end + data.len], data[0..data.len]);
-            // Optimization: originally just a modulo here but div is slow compared to
-            // a branch or condition move. 
-            const new_end = this.end + data.len;
-            this.end = if (new_end == this.buffer_size) 0 else new_end;
-        }
-        this.count += data.len;
-        return;
+    pub fn feed(self: *Self, data: []const u8) MsgPackError!void {
+        try self.ring.feed(data);
     }
 };
 
@@ -126,7 +82,7 @@ pub fn unpack(allocator: std.mem.Allocator, input: []const u8) !MsgPackObject {
     // 94 00 = 1001 0100 0000 0000 
     const i :usize = 0;
     if (input.len == 0) {
-        return MsgPackError.incomplete;
+        return MsgPackError.Incomplete;
     }
 
     var obj: MsgPackObject = undefined;
@@ -153,190 +109,29 @@ test "unpack command" {
 
 }
 
-test "Unpacker: construction with 128-byte buffer" {
+test "Unpacker: construction and feed delegation to RingBuffer" {
     const allocator = std.testing.allocator;
     var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
     defer unpacker.deinit();
 
-    try std.testing.expectEqual(@as(usize, 128), unpacker.buffer_size);
-    try std.testing.expectEqual(@as(usize, 128), unpacker.buffer.len);
-    try std.testing.expectEqual(@as(usize, 0), unpacker.count);
-    try std.testing.expectEqual(@as(usize, 0), unpacker.start);
-    try std.testing.expectEqual(@as(usize, 0), unpacker.end);
+    try std.testing.expectEqual(@as(usize, 128), unpacker.ring.buffer_size);
+    try std.testing.expectEqual(@as(usize, 0), unpacker.ring.count);
+
+    try unpacker.feed("hello world");
+    try std.testing.expectEqual(@as(usize, 11), unpacker.ring.count);
+    try std.testing.expectEqualSlices(u8, "hello world", unpacker.ring.buffer[0..11]);
 }
 
-test "Unpacker.feed: empty input (0 bytes)" {
+test "Unpacker: invalid buffer size" {
     const allocator = std.testing.allocator;
-    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    try std.testing.expectError(error.InvalidBufferSize, Unpacker.init(allocator, .{ .max_buffer_size = 0 }));
+}
+
+test "Unpacker: overflow forwards NoRoomInBuffer" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 10 });
     defer unpacker.deinit();
 
-    try unpacker.feed(&.{});
-
-    try std.testing.expectEqual(@as(usize, 0), unpacker.count);
-    try std.testing.expectEqual(@as(usize, 0), unpacker.end);
+    try std.testing.expectError(error.NoRoomInBuffer, unpacker.feed("A" ** 11));
 }
 
-test "Unpacker.feed: partial and sequential feeds without wrap" {
-    const allocator = std.testing.allocator;
-    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
-    defer unpacker.deinit();
-
-    // First chunk: 40 bytes
-    const chunk1 = "A" ** 40;
-    try unpacker.feed(chunk1);
-    try std.testing.expectEqual(@as(usize, 40), unpacker.count);
-    try std.testing.expectEqual(@as(usize, 40), unpacker.end);
-    try std.testing.expectEqualSlices(u8, chunk1, unpacker.buffer[0..40]);
-
-    // Second chunk: 50 bytes (total 90 bytes)
-    const chunk2 = "B" ** 50;
-    try unpacker.feed(chunk2);
-    try std.testing.expectEqual(@as(usize, 90), unpacker.count);
-    try std.testing.expectEqual(@as(usize, 90), unpacker.end);
-    try std.testing.expectEqualSlices(u8, chunk2, unpacker.buffer[40..90]);
-}
-
-test "Unpacker.feed: exact full capacity (128 bytes)" {
-    const allocator = std.testing.allocator;
-    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
-    defer unpacker.deinit();
-
-    const full_data = "X" ** 128;
-    try unpacker.feed(full_data);
-
-    try std.testing.expectEqual(@as(usize, 128), unpacker.count);
-    try std.testing.expectEqualSlices(u8, full_data, unpacker.buffer[0..128]);
-}
-
-test "Unpacker.feed: overflow on empty buffer (> 128 bytes)" {
-    const allocator = std.testing.allocator;
-    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
-    defer unpacker.deinit();
-
-    const too_large = "Z" ** 129;
-    try std.testing.expectError(error.noRoomInBuffer, unpacker.feed(too_large));
-
-    // State should remain unchanged
-    try std.testing.expectEqual(@as(usize, 0), unpacker.count);
-    try std.testing.expectEqual(@as(usize, 0), unpacker.end);
-}
-
-test "Unpacker.feed: overflow on partially full buffer" {
-    const allocator = std.testing.allocator;
-    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
-    defer unpacker.deinit();
-
-    // Fill 100 bytes
-    try unpacker.feed("A" ** 100);
-    try std.testing.expectEqual(@as(usize, 100), unpacker.count);
-
-    // Attempt to feed 29 bytes (100 + 29 = 129 > 128)
-    try std.testing.expectError(error.noRoomInBuffer, unpacker.feed("B" ** 29));
-
-    // State should remain unchanged from before the failed feed
-    try std.testing.expectEqual(@as(usize, 100), unpacker.count);
-    try std.testing.expectEqual(@as(usize, 100), unpacker.end);
-}
-
-test "Unpacker.feed: feeding when completely full" {
-    const allocator = std.testing.allocator;
-    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
-    defer unpacker.deinit();
-
-    try unpacker.feed("A" ** 128);
-    try std.testing.expectEqual(@as(usize, 128), unpacker.count);
-
-    // Even a single byte should fail
-    try std.testing.expectError(error.noRoomInBuffer, unpacker.feed("B"));
-    try std.testing.expectEqual(@as(usize, 128), unpacker.count);
-}
-
-test "Unpacker.feed: wrap-around across buffer boundary" {
-    const allocator = std.testing.allocator;
-    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
-    defer unpacker.deinit();
-
-    // Simulate state where 100 bytes were written and consumed:
-    // end is at 100, buffer has 28 bytes until the end of the array.
-    unpacker.start = 100;
-    unpacker.end = 100;
-    unpacker.count = 0;
-
-    // Feed 50 bytes: 28 bytes fit at [100..128], 22 bytes wrap to [0..22]
-    const data = ("A" ** 28) ++ ("B" ** 22);
-    try unpacker.feed(data);
-
-    try std.testing.expectEqual(@as(usize, 50), unpacker.count);
-    try std.testing.expectEqual(@as(usize, 22), unpacker.end);
-
-    // Verify both contiguous halves
-    try std.testing.expectEqualSlices(u8, "A" ** 28, unpacker.buffer[100..128]);
-    try std.testing.expectEqualSlices(u8, "B" ** 22, unpacker.buffer[0..22]);
-}
-
-test "Unpacker.feed: wrap-around landing exactly at boundary (end == 128 wraps to 0)" {
-    const allocator = std.testing.allocator;
-    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
-    defer unpacker.deinit();
-
-    // Start at offset 100 with 0 count
-    unpacker.start = 100;
-    unpacker.end = 100;
-    unpacker.count = 0;
-
-    // Exactly 28 bytes to reach index 128
-    const data = "C" ** 28;
-    try unpacker.feed(data);
-
-    try std.testing.expectEqual(@as(usize, 28), unpacker.count);
-    try std.testing.expectEqual(@as(usize, 0), unpacker.end);
-    try std.testing.expectEqualSlices(u8, data, unpacker.buffer[100..128]);
-}
-
-test "Unpacker.init: zero-sized buffer returns invalidBufferSize" {
-    const allocator = std.testing.allocator;
-    try std.testing.expectError(error.invalidBufferSize, Unpacker.init(allocator, .{ .max_buffer_size = 0 }));
-}
-
-test "Unpacker.feed: multiple successive wraps" {
-    const allocator = std.testing.allocator;
-    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
-    defer unpacker.deinit();
-
-    // Cycle 1: Fill 100, simulate consuming 100
-    try unpacker.feed("A" ** 100);
-    unpacker.start = 100;
-    unpacker.count = 0;
-
-    // Wrap 1: 50 bytes (28 at end [100..128], 22 at start [0..22])
-    try unpacker.feed("B" ** 50);
-    try std.testing.expectEqual(@as(usize, 22), unpacker.end);
-    try std.testing.expectEqual(@as(usize, 50), unpacker.count);
-    try std.testing.expectEqualSlices(u8, "B" ** 28, unpacker.buffer[100..128]);
-    try std.testing.expectEqualSlices(u8, "B" ** 22, unpacker.buffer[0..22]);
-
-    // Simulate consuming 50 bytes
-    unpacker.start = 22;
-    unpacker.count = 0;
-
-    // Wrap 2: 120 bytes from offset 22 (106 at end [22..128], 14 at start [0..14])
-    try unpacker.feed("C" ** 120);
-    try std.testing.expectEqual(@as(usize, 14), unpacker.end);
-    try std.testing.expectEqual(@as(usize, 120), unpacker.count);
-    try std.testing.expectEqualSlices(u8, "C" ** 106, unpacker.buffer[22..128]);
-    try std.testing.expectEqualSlices(u8, "C" ** 14, unpacker.buffer[0..14]);
-}
-
-test "Unpacker.feed: byte-by-byte until full" {
-    const allocator = std.testing.allocator;
-    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
-    defer unpacker.deinit();
-
-    const byte = [_]u8{'Z'};
-    for (0..128) |i| {
-        try unpacker.feed(&byte);
-        try std.testing.expectEqual(i + 1, unpacker.count);
-    }
-    try std.testing.expectEqual(@as(usize, 0), unpacker.end);
-    try std.testing.expectError(error.noRoomInBuffer, unpacker.feed(&byte));
-}
