@@ -33,32 +33,6 @@ pub fn main(init: std.process.Init) !void {
 
 //// Unpacker implementation 
 
-pub fn Unpacker() type {
-    return struct {
-        const This = @This();
-        allocator: std.mem.Allocator, 
-        start: usize,
-        end: usize,
-        count: usize,
-        buffer: []u8,
-
-        pub fn init(allocator: std.mem.Allocator, bufferSize: usize) MsgPackError!This {
-            const buffer = try allocator.alloc(u8, bufferSize);
-            return This {
-                .allocator = allocator,
-                .start = 0,
-                .end = 0,
-                .count = 0,
-                .buffer = buffer,
-            };
-        }
-
-        pub fn deinit(this: *This) void {
-            this.buffer.free();
-        }
-    };
-}
-
 pub const MsgPackType = enum {
     array,
     integer,
@@ -74,6 +48,58 @@ pub const MsgPackObject = union(MsgPackType) {
 pub const MsgPackError = error {
     incomplete, // If you run out of bytes while parsing
     outOfMemory,
+    noRoomInBuffer,
+};
+
+pub const Unpacker = struct {
+    pub const Options = struct {
+        max_buffer_size: usize = 1024 * 1024, // 1MB default
+    };
+
+    const This = @This();
+    allocator: std.mem.Allocator, 
+    start: usize,
+    end: usize,
+    count: usize,
+    buffer: []u8,
+    buffer_size: usize,
+
+    pub fn init(allocator: std.mem.Allocator, options: Options) MsgPackError!This {
+        const buffer = try allocator.alloc(u8, options.max_buffer_size);
+        return This {
+            .allocator = allocator,
+            .start = 0,
+            .end = 0,
+            .count = 0,
+            .buffer = buffer,
+            .buffer_size = options.max_buffer_size,
+        };
+    }
+
+    pub fn deinit(this: *This) void {
+        this.buffer.free();
+    }
+
+    pub fn feed(this: *This, data: []const u8) MsgPackError!void {
+        if (this.count + data.len > this.buffer_size) {
+            return .noRoomInBuffer;
+        }
+
+        // Since this is a ring buffer it will either fit in one go or we 
+        // need to fill to the end then do the rest at the beginning
+        if (this.start + data.len > this.buffer_size) {
+            const fill = data.len - this.end;
+            @memcpy(&data[0..fill], &this.buffer[this.end..this.buffer_size]);
+            @memcpy(&data[fill..data.len], &this.buffer[0..fill]);
+            this.count += data.len;
+            this.end = fill;
+        } else {
+            @memcpy(&data[0..data.len], &this.buffer[this.end..this.end + data.len]);
+            this.end = this.end + data.len;
+        }
+        this.count += data.len;
+        return;
+    }
 };
 
 // Next step: a read_object command that returns an updated buffer offset 
