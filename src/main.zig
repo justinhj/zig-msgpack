@@ -95,7 +95,7 @@ pub const Unpacker = struct {
         std.debug.print("Data len {d} start {d} end {d} remaining {d}\n", .{data.len, this.start, this.end, remaining_space});
         if (remaining_space < data.len) {
             const left_over = data.len - remaining_space;
-            std.debug.print("left over {d}", .{left_over});
+            std.debug.print("left over {d}\n", .{left_over});
             // Wrap
             if (remaining_space > 0) {
                 @memcpy(this.buffer[this.end..this.end + remaining_space], data[0..remaining_space]);
@@ -107,7 +107,7 @@ pub const Unpacker = struct {
         } else {
             // No wrap
             @memcpy(this.buffer[this.end..this.end + data.len], data[0..data.len]);
-            this.end = this.end + data.len;
+            this.end = @mod(this.end + data.len, this.buffer_size);
         }
         this.count += data.len;
         return;
