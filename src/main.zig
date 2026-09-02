@@ -292,3 +292,51 @@ test "Unpacker.feed: wrap-around landing exactly at boundary (end == 128 wraps t
     try std.testing.expectEqual(@as(usize, 0), unpacker.end);
     try std.testing.expectEqualSlices(u8, data, unpacker.buffer[100..128]);
 }
+
+test "Unpacker.init: zero-sized buffer returns invalidBufferSize" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.invalidBufferSize, Unpacker.init(allocator, .{ .max_buffer_size = 0 }));
+}
+
+test "Unpacker.feed: multiple successive wraps" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // Cycle 1: Fill 100, simulate consuming 100
+    try unpacker.feed("A" ** 100);
+    unpacker.start = 100;
+    unpacker.count = 0;
+
+    // Wrap 1: 50 bytes (28 at end [100..128], 22 at start [0..22])
+    try unpacker.feed("B" ** 50);
+    try std.testing.expectEqual(@as(usize, 22), unpacker.end);
+    try std.testing.expectEqual(@as(usize, 50), unpacker.count);
+    try std.testing.expectEqualSlices(u8, "B" ** 28, unpacker.buffer[100..128]);
+    try std.testing.expectEqualSlices(u8, "B" ** 22, unpacker.buffer[0..22]);
+
+    // Simulate consuming 50 bytes
+    unpacker.start = 22;
+    unpacker.count = 0;
+
+    // Wrap 2: 120 bytes from offset 22 (106 at end [22..128], 14 at start [0..14])
+    try unpacker.feed("C" ** 120);
+    try std.testing.expectEqual(@as(usize, 14), unpacker.end);
+    try std.testing.expectEqual(@as(usize, 120), unpacker.count);
+    try std.testing.expectEqualSlices(u8, "C" ** 106, unpacker.buffer[22..128]);
+    try std.testing.expectEqualSlices(u8, "C" ** 14, unpacker.buffer[0..14]);
+}
+
+test "Unpacker.feed: byte-by-byte until full" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    const byte = [_]u8{'Z'};
+    for (0..128) |i| {
+        try unpacker.feed(&byte);
+        try std.testing.expectEqual(i + 1, unpacker.count);
+    }
+    try std.testing.expectEqual(@as(usize, 0), unpacker.end);
+    try std.testing.expectError(error.noRoomInBuffer, unpacker.feed(&byte));
+}
