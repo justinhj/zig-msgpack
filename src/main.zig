@@ -81,22 +81,20 @@ pub const Unpacker = struct {
     }
 
     pub fn feed(this: *This, data: []const u8) MsgPackError!void {
-        if (this.count + data.len > this.buffer_size) {
-            return MsgPackError.noRoomInBuffer;
-        }
-
         if (data.len == 0) {
             return;
+        }
+
+        if (this.count + data.len > this.buffer_size) {
+            return MsgPackError.noRoomInBuffer;
         }
 
         // Since this is a ring buffer it will either fit in one go or we 
         // need to fill to the end then do the rest at the beginning
         const remaining_space = this.buffer_size - (this.end);
-        std.debug.print("Data len {d} start {d} end {d} remaining {d}\n", .{data.len, this.start, this.end, remaining_space});
         if (remaining_space < data.len) {
-            const left_over = data.len - remaining_space;
-            std.debug.print("left over {d}\n", .{left_over});
             // Wrap
+            const left_over = data.len - remaining_space;
             if (remaining_space > 0) {
                 @memcpy(this.buffer[this.end..this.end + remaining_space], data[0..remaining_space]);
             }
