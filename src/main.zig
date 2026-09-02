@@ -49,6 +49,7 @@ pub const MsgPackError = error {
     incomplete, // If you run out of bytes while parsing
     outOfMemory,
     noRoomInBuffer,
+    invalidBufferSize,
 };
 
 pub const Unpacker = struct {
@@ -65,6 +66,9 @@ pub const Unpacker = struct {
     buffer_size: usize,
 
     pub fn init(allocator: std.mem.Allocator, options: Options) MsgPackError!This {
+        if (options.max_buffer_size == 0) {
+            return MsgPackError.invalidBufferSize;
+        }
         const buffer = allocator.alloc(u8, options.max_buffer_size) catch return MsgPackError.outOfMemory;
         return This {
             .allocator = allocator,
@@ -85,7 +89,7 @@ pub const Unpacker = struct {
             return;
         }
 
-        if (this.count + data.len > this.buffer_size) {
+        if (data.len > this.buffer_size - this.count) {
             return MsgPackError.noRoomInBuffer;
         }
 
@@ -95,17 +99,16 @@ pub const Unpacker = struct {
         if (remaining_space < data.len) {
             // Wrap
             const left_over = data.len - remaining_space;
-            if (remaining_space > 0) {
-                @memcpy(this.buffer[this.end..this.end + remaining_space], data[0..remaining_space]);
-            }
-            if (left_over > 0) {
-                @memcpy(this.buffer[0..left_over], data[remaining_space..data.len]);
-            }
+            @memcpy(this.buffer[this.end..this.end + remaining_space], data[0..remaining_space]);
+            @memcpy(this.buffer[0..left_over], data[remaining_space..data.len]);
             this.end = left_over;
         } else {
             // No wrap
             @memcpy(this.buffer[this.end..this.end + data.len], data[0..data.len]);
-            this.end = @mod(this.end + data.len, this.buffer_size);
+            // Optimization: originally just a modulo here but div is slow compared to
+            // a branch or condition move. 
+            const new_end = this.end + data.len;
+            this.end = if (new_end == this.buffer_size) 0 else new_end;
         }
         this.count += data.len;
         return;
