@@ -85,15 +85,27 @@ pub const Unpacker = struct {
             return MsgPackError.noRoomInBuffer;
         }
 
+        if (data.len == 0) {
+            return;
+        }
+
         // Since this is a ring buffer it will either fit in one go or we 
         // need to fill to the end then do the rest at the beginning
-        if (this.start + data.len > this.buffer_size) {
-            const fill = data.len - this.end;
-            @memcpy(this.buffer[this.end..this.buffer_size], data[0..fill]);
-            @memcpy(this.buffer[0..fill], data[fill..data.len]);
-            this.count += data.len;
-            this.end = fill;
+        const remaining_space = this.buffer_size - (this.end);
+        std.debug.print("Data len {d} start {d} end {d} remaining {d}\n", .{data.len, this.start, this.end, remaining_space});
+        if (remaining_space < data.len) {
+            const left_over = data.len - remaining_space;
+            std.debug.print("left over {d}", .{left_over});
+            // Wrap
+            if (remaining_space > 0) {
+                @memcpy(this.buffer[this.end..this.end + remaining_space], data[0..remaining_space]);
+            }
+            if (left_over > 0) {
+                @memcpy(this.buffer[0..left_over], data[remaining_space..data.len]);
+            }
+            this.end = left_over;
         } else {
+            // No wrap
             @memcpy(this.buffer[this.end..this.end + data.len], data[0..data.len]);
             this.end = this.end + data.len;
         }

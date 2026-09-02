@@ -25,5 +25,19 @@ Basing the API on the pynvim use of msgpack which uses Unpacker.
 
 Note the callback approach may or may not be the best interface in Zig.
 
+init
+we want to create a fixed size circular buffer specified by the caller and defaulting to 1Mb.
+we need a pointer to the start of the buffer, end and the count.
+the start is 0 and the length is 0
+
+feed(data) -> void 
+write the data at end 
+handle wrap around 
+handle no capacity 
+
+read() -> MsgPackError!MsgPackObject
+
+
+
 
 
