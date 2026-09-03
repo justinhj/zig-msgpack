@@ -132,48 +132,57 @@ pub const Unpacker = struct {
                 return MsgPackObject{ .array = array };
             },
 
+            0xa0...0xbf => {
+                const length = next_char - 0xa0;
+                const str = try self.allocator.alloc(u8, length);
+                errdefer self.allocator.free(str);
+
+                for (0..length) |i| {
+                    str[i] = try self.ring.get();
+                }
+                return MsgPackObject{ .string = str };
+            },
+
             // Unhandled formats for this stage
             else => MsgPackError.Incomplete,
         };
     }
 };
 
-// Next step: a read_object command that returns an updated buffer offset 
-// and a parsed object. It should return an incomplete error if it runs out of 
-// data to parse.
-// Unpack should call read object. This allows re-entrant behavior to handle 
-// nested objects like arrays and arrays of arrays.
-
-// Unpack the msgpack data to 
-pub fn unpack(allocator: std.mem.Allocator, input: []const u8) !MsgPackObject {
-    // 94 00 = 1001 0100 0000 0000 
-    const i :usize = 0;
-    if (input.len == 0) {
-        return MsgPackError.Incomplete;
-    }
-
-    var obj: MsgPackObject = undefined;
-
-    // maximum number of elements of an Array object is `(2^32)-1`
-    // Check for fixarray (up to 15 elements)
-    if (input[i] >= 0x94 and input[i] <= 0x9f) {
-        const array = try allocator.alloc(MsgPackObject, input[i] - 0x90);
-        obj = MsgPackObject{ .array = array };
-    } 
-    return obj;
-} 
-
 test "unpack command" {
     const gpa = std.testing.allocator;
-    const test_input = "\x94\x00\x01\xa9nvim_eval\x91\xa52 + 2";
-    // Output [0, 1, 'nvim_eval', ['2 + 2']]
-    const obj = try unpack(gpa, test_input);
-    try std.testing.expect(obj == .array);
-    switch (obj) {
-        .array => gpa.free(obj.array),
-        else => {}
-    }
+    var unpacker = try Unpacker.init(gpa, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
 
+    const test_input = "\x94\x00\x01\xa9nvim_eval\x91\xa52 + 2";
+    try unpacker.feed(test_input);
+
+    const obj = try unpacker.next();
+    defer freeObject(gpa, obj);
+
+    // Verify outer array: [0, 1, "nvim_eval", ["2 + 2"]]
+    try std.testing.expect(obj == .array);
+    try std.testing.expectEqual(@as(usize, 4), obj.array.len);
+
+    // [0] = 0
+    try std.testing.expectEqual(@as(i64, 0), obj.array[0].integer);
+
+    // [1] = 1
+    try std.testing.expectEqual(@as(i64, 1), obj.array[1].integer);
+
+    // [2] = "nvim_eval"
+    try std.testing.expect(obj.array[2] == .string);
+    try std.testing.expectEqualStrings("nvim_eval", obj.array[2].string);
+
+    // [3] = ["2 + 2"]
+    const params = obj.array[3];
+    try std.testing.expect(params == .array);
+    try std.testing.expectEqual(@as(usize, 1), params.array.len);
+    try std.testing.expect(params.array[0] == .string);
+    try std.testing.expectEqualStrings("2 + 2", params.array[0].string);
+
+    // End of buffer
+    try std.testing.expectError(error.NoMessage, unpacker.next());
 }
 
 test "Unpacker: construction and feed delegation to RingBuffer" {
