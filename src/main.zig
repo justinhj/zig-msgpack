@@ -77,13 +77,23 @@ pub const Unpacker = struct {
             return MsgPackError.NoMessage;
         }
 
-        // var obj: MsgPackObject = undefined;
+        var obj: MsgPackObject = undefined;
+        const next_char = try self.ring.get();
 
-        // if (input[i] >= 0x94 and input[i] <= 0x9f) {
-        //     const array = try allocator.alloc(*MsgPackObject, input[i] - 0x90);
-        //     obj = MsgPackObject{ .array = array };
-        // } 
-        return MsgPackError.Incomplete; // TEMP
+        if (next_char >= 0x90 and next_char <= 0x9f) {
+            // Handle fixarray
+            const item_count = next_char - 0x90; 
+            const array = try self.allocator.alloc(*MsgPackObject, item_count);
+            obj = MsgPackObject{ .array = array };
+            for (0..item_count) |i| {
+                const item = try self.next();
+                obj.array[i] = item;
+            }
+        } else if (next_char & 0x80 == 0) {
+            // Handle positive fixint
+            obj = MsgPackObject{.integer = next_char};
+        }
+        return obj;
     }
 };
 
