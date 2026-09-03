@@ -6,3 +6,8 @@ pub const ringbuffer = @import("ringbuffer.zig");
 pub const RingBuffer = ringbuffer.RingBuffer;
 pub const RingBufferError = ringbuffer.RingBufferError;
 
+test {
+    std.testing.refAllDecls(@This());
+    _ = ringbuffer;
+}
+
