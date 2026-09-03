@@ -4,6 +4,7 @@ pub const RingBufferError = error{
     OutOfMemory,
     NoRoomInBuffer,
     InvalidBufferSize,
+    EndOfBuffer,
 };
 
 pub const RingBuffer = struct {
@@ -47,6 +48,7 @@ pub const RingBuffer = struct {
         if (self.start == self.buffer_size) {
             self.start = 0;
         }
+        self.count -= 1;
         return value;
     }
 
@@ -273,3 +275,146 @@ test "RingBuffer.feed: byte-by-byte until full" {
     try std.testing.expectEqual(@as(usize, 0), rb.end);
     try std.testing.expectError(error.NoRoomInBuffer, rb.feed(&byte));
 }
+
+test "RingBuffer.peek: empty buffer returns EndOfBuffer" {
+    const allocator = std.testing.allocator;
+    var rb = try RingBuffer.init(allocator, .{ .max_buffer_size = 128 });
+    defer rb.deinit();
+
+    try std.testing.expectError(error.EndOfBuffer, rb.peek());
+}
+
+test "RingBuffer.get: empty buffer returns EndOfBuffer" {
+    const allocator = std.testing.allocator;
+    var rb = try RingBuffer.init(allocator, .{ .max_buffer_size = 128 });
+    defer rb.deinit();
+
+    try std.testing.expectError(error.EndOfBuffer, rb.get());
+}
+
+test "RingBuffer.peek: inspects front element without consuming" {
+    const allocator = std.testing.allocator;
+    var rb = try RingBuffer.init(allocator, .{ .max_buffer_size = 128 });
+    defer rb.deinit();
+
+    try rb.feed("XYZ");
+    try std.testing.expectEqual(@as(usize, 3), rb.count);
+    try std.testing.expectEqual(@as(usize, 0), rb.start);
+
+    // peek multiple times: always returns 'X', doesn't change count or start
+    try std.testing.expectEqual(@as(u8, 'X'), try rb.peek());
+    try std.testing.expectEqual(@as(u8, 'X'), try rb.peek());
+    try std.testing.expectEqual(@as(usize, 3), rb.count);
+    try std.testing.expectEqual(@as(usize, 0), rb.start);
+}
+
+test "RingBuffer.get: consumes elements in FIFO order" {
+    const allocator = std.testing.allocator;
+    var rb = try RingBuffer.init(allocator, .{ .max_buffer_size = 128 });
+    defer rb.deinit();
+
+    try rb.feed("HELLO");
+    try std.testing.expectEqual(@as(usize, 5), rb.count);
+
+    try std.testing.expectEqual(@as(u8, 'H'), try rb.get());
+    try std.testing.expectEqual(@as(usize, 4), rb.count);
+
+    try std.testing.expectEqual(@as(u8, 'E'), try rb.get());
+    try std.testing.expectEqual(@as(usize, 3), rb.count);
+
+    try std.testing.expectEqual(@as(u8, 'L'), try rb.get());
+    try std.testing.expectEqual(@as(usize, 2), rb.count);
+
+    try std.testing.expectEqual(@as(u8, 'L'), try rb.get());
+    try std.testing.expectEqual(@as(usize, 1), rb.count);
+
+    try std.testing.expectEqual(@as(u8, 'O'), try rb.get());
+    try std.testing.expectEqual(@as(usize, 0), rb.count);
+
+    // Buffer is now exhausted
+    try std.testing.expectError(error.EndOfBuffer, rb.get());
+    try std.testing.expectError(error.EndOfBuffer, rb.peek());
+}
+
+test "RingBuffer.get: wrap-around reads across boundary" {
+    const allocator = std.testing.allocator;
+    var rb = try RingBuffer.init(allocator, .{ .max_buffer_size = 128 });
+    defer rb.deinit();
+
+    // Position end at 125, start at 125
+    rb.start = 125;
+    rb.end = 125;
+    rb.count = 0;
+
+    // Feed 7 bytes: 3 bytes at [125..128] ("ABC"), 4 bytes wrap to [0..4] ("DEFG")
+    try rb.feed("ABCDEFG");
+    try std.testing.expectEqual(@as(usize, 7), rb.count);
+    try std.testing.expectEqual(@as(usize, 4), rb.end);
+
+    // Read all 7 bytes and check they wrap across start boundary seamlessly
+    const expected = "ABCDEFG";
+    for (expected) |exp_ch| {
+        const ch = try rb.get();
+        try std.testing.expectEqual(exp_ch, ch);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), rb.count);
+    try std.testing.expectEqual(@as(usize, 4), rb.start);
+    try std.testing.expectError(error.EndOfBuffer, rb.get());
+}
+
+test "RingBuffer: interleaved feed and get reclaiming buffer space" {
+    const allocator = std.testing.allocator;
+    var rb = try RingBuffer.init(allocator, .{ .max_buffer_size = 128 });
+    defer rb.deinit();
+
+    // Feed 100 bytes
+    try rb.feed("A" ** 100);
+    try std.testing.expectEqual(@as(usize, 100), rb.count);
+
+    // Consume 50 bytes
+    for (0..50) |_| {
+        try std.testing.expectEqual(@as(u8, 'A'), try rb.get());
+    }
+    try std.testing.expectEqual(@as(usize, 50), rb.count);
+
+    // Feed 60 more bytes (100 - 50 + 60 = 110 <= 128)
+    // This succeeds because count was properly decremented
+    try rb.feed("B" ** 60);
+    try std.testing.expectEqual(@as(usize, 110), rb.count);
+
+    // Consume the remaining 50 'A's
+    for (0..50) |_| {
+        try std.testing.expectEqual(@as(u8, 'A'), try rb.get());
+    }
+
+    // Consume the 60 'B's
+    for (0..60) |_| {
+        try std.testing.expectEqual(@as(u8, 'B'), try rb.get());
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), rb.count);
+    try std.testing.expectError(error.EndOfBuffer, rb.get());
+}
+
+test "RingBuffer: peek followed by get" {
+    const allocator = std.testing.allocator;
+    var rb = try RingBuffer.init(allocator, .{ .max_buffer_size = 128 });
+    defer rb.deinit();
+
+    try rb.feed("123");
+
+    // peek first, then get
+    try std.testing.expectEqual(@as(u8, '1'), try rb.peek());
+    try std.testing.expectEqual(@as(u8, '1'), try rb.get());
+
+    try std.testing.expectEqual(@as(u8, '2'), try rb.peek());
+    try std.testing.expectEqual(@as(u8, '2'), try rb.get());
+
+    try std.testing.expectEqual(@as(u8, '3'), try rb.peek());
+    try std.testing.expectEqual(@as(u8, '3'), try rb.get());
+
+    try std.testing.expectError(error.EndOfBuffer, rb.peek());
+    try std.testing.expectError(error.EndOfBuffer, rb.get());
+}
+
