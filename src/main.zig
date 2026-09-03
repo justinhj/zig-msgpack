@@ -43,6 +43,7 @@ pub const MsgPackObject = union(MsgPackType) {
 
 pub const MsgPackError = error{
     Incomplete, // If you run out of bytes while parsing
+    NoMessage,
 } || RingBufferError;
 
 pub const Unpacker = struct {
@@ -68,6 +69,21 @@ pub const Unpacker = struct {
 
     pub fn feed(self: *Self, data: []const u8) MsgPackError!void {
         try self.ring.feed(data);
+    }
+
+    pub fn next(self: *Self) MsgPackError!MsgPackObject {
+        // When the buffer is empty
+        if (self.ring.count == 0) {
+            return MsgPackError.NoMessage;
+        }
+
+        // var obj: MsgPackObject = undefined;
+
+        // if (input[i] >= 0x94 and input[i] <= 0x9f) {
+        //     const array = try allocator.alloc(*MsgPackObject, input[i] - 0x90);
+        //     obj = MsgPackObject{ .array = array };
+        // } 
+        return MsgPackError.Incomplete; // TEMP
     }
 };
 

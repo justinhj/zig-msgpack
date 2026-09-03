@@ -38,6 +38,25 @@ pub const RingBuffer = struct {
         self.allocator.free(self.buffer);
     }
 
+    pub fn get(self: *Self) RingBufferError!u8 {
+        if (self.count == 0) {
+            return RingBufferError.EndOfBuffer;
+        }
+        const value = self.buffer[self.start];
+        self.start = self.start + 1;
+        if (self.start == self.buffer_size) {
+            self.start = 0;
+        }
+        return value;
+    }
+
+    pub fn peek(self: *Self) RingBufferError!u8 {
+        if (self.count == 0) {
+            return RingBufferError.EndOfBuffer;
+        }
+        return self.buffer[self.start];
+    }
+
     pub fn feed(self: *Self, data: []const u8) RingBufferError!void {
         if (data.len == 0) {
             return;
