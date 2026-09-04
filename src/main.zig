@@ -29,16 +29,42 @@ pub fn main(init: std.process.Init) !void {
 const RingBuffer = zig_msgpack.RingBuffer;
 const RingBufferError = zig_msgpack.RingBufferError;
 
+pub const MapEntry = struct {
+    key: MsgPackObject,
+    value: MsgPackObject,
+};
+
+pub const Extension = struct {
+    type: i8,
+    data: []u8,
+};
+
 pub const MsgPackType = enum {
-    array,
+    nil,
+    boolean,
     integer,
+    unsigned_integer,
+    float32,
+    float64,
     string,
+    binary,
+    array,
+    map,
+    extension,
 };
 
 pub const MsgPackObject = union(MsgPackType) {
-    array: []MsgPackObject,
+    nil: void,
+    boolean: bool,
     integer: i64,
+    unsigned_integer: u64,
+    float32: f32,
+    float64: f64,
     string: []u8,
+    binary: []u8,
+    array: []MsgPackObject,
+    map: []MapEntry,
+    extension: Extension,
 };
 
 pub fn freeObject(allocator: std.mem.Allocator, obj: MsgPackObject) void {
@@ -49,7 +75,16 @@ pub fn freeObject(allocator: std.mem.Allocator, obj: MsgPackObject) void {
             }
             allocator.free(arr);
         },
+        .map => |entries| {
+            for (entries) |entry| {
+                freeObject(allocator, entry.key);
+                freeObject(allocator, entry.value);
+            }
+            allocator.free(entries);
+        },
         .string => |str| allocator.free(str),
+        .binary => |bin| allocator.free(bin),
+        .extension => |ext| allocator.free(ext.data),
         else => {},
     }
 }
@@ -382,5 +417,543 @@ test "Unpacker.next: incomplete nested array followed by feed" {
 
     try std.testing.expectError(error.NoMessage, unpacker.next());
 }
+
+// =========================================================================
+// Tests for Unimplemented MsgPack Formats (TDD)
+// =========================================================================
+
+// --- Nil Format ---
+test "Unpacker: nil format (0xc0)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    try unpacker.feed("\xc0");
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .nil);
+}
+
+// --- Bool Format Family ---
+test "Unpacker: bool false (0xc2) and true (0xc3)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    try unpacker.feed("\xc2\xc3");
+
+    const obj_false = try unpacker.next();
+    defer freeObject(allocator, obj_false);
+    try std.testing.expect(obj_false == .boolean);
+    try std.testing.expectEqual(false, obj_false.boolean);
+
+    const obj_true = try unpacker.next();
+    defer freeObject(allocator, obj_true);
+    try std.testing.expect(obj_true == .boolean);
+    try std.testing.expectEqual(true, obj_true.boolean);
+}
+
+// --- Negative Fixint (0xe0 - 0xff) ---
+test "Unpacker: negative fixint" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xff = -1, 0xe0 = -32, 0xf0 = -16
+    try unpacker.feed("\xff\xe0\xf0");
+
+    const obj1 = try unpacker.next();
+    try std.testing.expect(obj1 == .integer);
+    try std.testing.expectEqual(@as(i64, -1), obj1.integer);
+
+    const obj2 = try unpacker.next();
+    try std.testing.expect(obj2 == .integer);
+    try std.testing.expectEqual(@as(i64, -32), obj2.integer);
+
+    const obj3 = try unpacker.next();
+    try std.testing.expect(obj3 == .integer);
+    try std.testing.expectEqual(@as(i64, -16), obj3.integer);
+}
+
+// --- Unsigned Int Family (uint8, uint16, uint32, uint64) ---
+test "Unpacker: uint 8 (0xcc)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xcc followed by 0x80 (128) and 0xff (255)
+    try unpacker.feed("\xcc\x80\xcc\xff");
+
+    const obj1 = try unpacker.next();
+    try std.testing.expect(obj1 == .integer);
+    try std.testing.expectEqual(@as(i64, 128), obj1.integer);
+
+    const obj2 = try unpacker.next();
+    try std.testing.expect(obj2 == .integer);
+    try std.testing.expectEqual(@as(i64, 255), obj2.integer);
+}
+
+test "Unpacker: uint 16 (0xcd)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xcd followed by 0x01, 0x00 (256) and 0xff, 0xff (65535)
+    try unpacker.feed("\xcd\x01\x00\xcd\xff\xff");
+
+    const obj1 = try unpacker.next();
+    try std.testing.expect(obj1 == .integer);
+    try std.testing.expectEqual(@as(i64, 256), obj1.integer);
+
+    const obj2 = try unpacker.next();
+    try std.testing.expect(obj2 == .integer);
+    try std.testing.expectEqual(@as(i64, 65535), obj2.integer);
+}
+
+test "Unpacker: uint 32 (0xce)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xce followed by 0x00, 0x01, 0x00, 0x00 (65536)
+    try unpacker.feed("\xce\x00\x01\x00\x00");
+
+    const obj = try unpacker.next();
+    try std.testing.expect(obj == .integer);
+    try std.testing.expectEqual(@as(i64, 65536), obj.integer);
+}
+
+test "Unpacker: uint 64 (0xcf)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xcf followed by 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 (2^63, exceeds max i64)
+    try unpacker.feed("\xcf\x80\x00\x00\x00\x00\x00\x00\x00");
+
+    const obj = try unpacker.next();
+    try std.testing.expect(obj == .unsigned_integer);
+    try std.testing.expectEqual(@as(u64, 0x8000_0000_0000_0000), obj.unsigned_integer);
+}
+
+// --- Signed Int Family (int8, int16, int32, int64) ---
+test "Unpacker: int 8 (0xd0)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xd0 followed by 0x80 (-128) and 0x7f (127)
+    try unpacker.feed("\xd0\x80\xd0\x7f");
+
+    const obj1 = try unpacker.next();
+    try std.testing.expect(obj1 == .integer);
+    try std.testing.expectEqual(@as(i64, -128), obj1.integer);
+
+    const obj2 = try unpacker.next();
+    try std.testing.expect(obj2 == .integer);
+    try std.testing.expectEqual(@as(i64, 127), obj2.integer);
+}
+
+test "Unpacker: int 16 (0xd1)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xd1 followed by 0x80, 0x00 (-32768) and 0x7f, 0xff (32767)
+    try unpacker.feed("\xd1\x80\x00\xd1\x7f\xff");
+
+    const obj1 = try unpacker.next();
+    try std.testing.expect(obj1 == .integer);
+    try std.testing.expectEqual(@as(i64, -32768), obj1.integer);
+
+    const obj2 = try unpacker.next();
+    try std.testing.expect(obj2 == .integer);
+    try std.testing.expectEqual(@as(i64, 32767), obj2.integer);
+}
+
+test "Unpacker: int 32 (0xd2)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xd2 followed by 0x80, 0x00, 0x00, 0x00 (-2147483648)
+    try unpacker.feed("\xd2\x80\x00\x00\x00");
+
+    const obj = try unpacker.next();
+    try std.testing.expect(obj == .integer);
+    try std.testing.expectEqual(@as(i64, -2147483648), obj.integer);
+}
+
+test "Unpacker: int 64 (0xd3)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xd3 followed by -9223372036854775808 (min i64: 0x8000000000000000)
+    try unpacker.feed("\xd3\x80\x00\x00\x00\x00\x00\x00\x00");
+
+    const obj = try unpacker.next();
+    try std.testing.expect(obj == .integer);
+    try std.testing.expectEqual(std.math.minInt(i64), obj.integer);
+}
+
+// --- Float Family (float32, float64) ---
+test "Unpacker: float 32 (0xca)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xca followed by 0x40, 0x20, 0x00, 0x00 (2.5f)
+    try unpacker.feed("\xca\x40\x20\x00\x00");
+
+    const obj = try unpacker.next();
+    try std.testing.expect(obj == .float32);
+    try std.testing.expectEqual(@as(f32, 2.5), obj.float32);
+}
+
+test "Unpacker: float 64 (0xcb)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xcb followed by 0x40, 0x09, 0x21, 0xfb, 0x54, 0x44, 0x2d, 0x18 (3.141592653589793)
+    try unpacker.feed("\xcb\x40\x09\x21\xfb\x54\x44\x2d\x18");
+
+    const obj = try unpacker.next();
+    try std.testing.expect(obj == .float64);
+    try std.testing.expectEqual(@as(f64, 3.141592653589793), obj.float64);
+}
+
+// --- String Format Family (str8, str16, str32) ---
+test "Unpacker: str 8 (0xd9)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 256 });
+    defer unpacker.deinit();
+
+    // 0xd9, length 32 (0x20), followed by 32 'X's (above fixstr limit of 31)
+    const payload = "X" ** 32;
+    try unpacker.feed("\xd9\x20" ++ payload);
+
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .string);
+    try std.testing.expectEqualStrings(payload, obj.string);
+}
+
+test "Unpacker: str 16 (0xda)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 512 });
+    defer unpacker.deinit();
+
+    // 0xda, length 256 (0x0100), followed by 256 'Y's
+    const payload = "Y" ** 256;
+    try unpacker.feed("\xda\x01\x00" ++ payload);
+
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .string);
+    try std.testing.expectEqualStrings(payload, obj.string);
+}
+
+test "Unpacker: str 32 (0xdb)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xdb, length 5 (0x00000005), followed by "hello"
+    try unpacker.feed("\xdb\x00\x00\x00\x05hello");
+
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .string);
+    try std.testing.expectEqualStrings("hello", obj.string);
+}
+
+// --- Binary Format Family (bin8, bin16, bin32) ---
+test "Unpacker: bin 8 (0xc4)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xc4, length 4, followed by 4 raw bytes
+    try unpacker.feed("\xc4\x04\x01\x02\x03\x04");
+
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .binary);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4 }, obj.binary);
+}
+
+test "Unpacker: bin 16 (0xc5)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xc5, length 3 (0x0003), followed by 3 raw bytes
+    try unpacker.feed("\xc5\x00\x03\xaa\xbb\xcc");
+
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .binary);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xaa, 0xbb, 0xcc }, obj.binary);
+}
+
+test "Unpacker: bin 32 (0xc6)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xc6, length 2 (0x00000002), followed by 2 raw bytes
+    try unpacker.feed("\xc6\x00\x00\x00\x02\xde\xad");
+
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .binary);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xde, 0xad }, obj.binary);
+}
+
+// --- Array Extended Family (array16, array32) ---
+test "Unpacker: array 16 (0xdc)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xdc, length 16 (0x0010, above fixarray limit of 15), 16 positive fixints 0x01
+    try unpacker.feed("\xdc\x00\x10" ++ ("\x01" ** 16));
+
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .array);
+    try std.testing.expectEqual(@as(usize, 16), obj.array.len);
+    for (obj.array) |item| {
+        try std.testing.expectEqual(@as(i64, 1), item.integer);
+    }
+}
+
+test "Unpacker: array 32 (0xdd)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xdd, length 2 (0x00000002), followed by [1, 2]
+    try unpacker.feed("\xdd\x00\x00\x00\x02\x01\x02");
+
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .array);
+    try std.testing.expectEqual(@as(usize, 2), obj.array.len);
+    try std.testing.expectEqual(@as(i64, 1), obj.array[0].integer);
+    try std.testing.expectEqual(@as(i64, 2), obj.array[1].integer);
+}
+
+// --- Map Format Family (fixmap, map16, map32) ---
+test "Unpacker: empty fixmap (0x80)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    try unpacker.feed("\x80");
+
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .map);
+    try std.testing.expectEqual(@as(usize, 0), obj.map.len);
+}
+
+test "Unpacker: fixmap with key-value pairs (0x82)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // fixmap of 2 entries: {"a": 1, "b": 2}
+    // 0x82, 0xa1 'a', 0x01, 0xa1 'b', 0x02
+    try unpacker.feed("\x82\xa1a\x01\xa1b\x02");
+
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .map);
+    try std.testing.expectEqual(@as(usize, 2), obj.map.len);
+
+    try std.testing.expectEqualStrings("a", obj.map[0].key.string);
+    try std.testing.expectEqual(@as(i64, 1), obj.map[0].value.integer);
+
+    try std.testing.expectEqualStrings("b", obj.map[1].key.string);
+    try std.testing.expectEqual(@as(i64, 2), obj.map[1].value.integer);
+}
+
+test "Unpacker: map 16 (0xde)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xde, 1 entry (0x0001): {"x": 5}
+    try unpacker.feed("\xde\x00\x01\xa1x\x05");
+
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .map);
+    try std.testing.expectEqual(@as(usize, 1), obj.map.len);
+    try std.testing.expectEqualStrings("x", obj.map[0].key.string);
+    try std.testing.expectEqual(@as(i64, 5), obj.map[0].value.integer);
+}
+
+test "Unpacker: map 32 (0xdf)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xdf, 1 entry (0x00000001): {"y": 9}
+    try unpacker.feed("\xdf\x00\x00\x00\x01\xa1y\x09");
+
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .map);
+    try std.testing.expectEqual(@as(usize, 1), obj.map.len);
+    try std.testing.expectEqualStrings("y", obj.map[0].key.string);
+    try std.testing.expectEqual(@as(i64, 9), obj.map[0].value.integer);
+}
+
+// --- Extension Format Family (fixext, ext) ---
+test "Unpacker: fixext 1 (0xd4)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xd4, type 0x01, data 0xaa
+    try unpacker.feed("\xd4\x01\xaa");
+
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .extension);
+    try std.testing.expectEqual(@as(i8, 1), obj.extension.type);
+    try std.testing.expectEqualSlices(u8, &[_]u8{0xaa}, obj.extension.data);
+}
+
+test "Unpacker: fixext 2 (0xd5)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xd5, type 0x02, data 0xaa, 0xbb
+    try unpacker.feed("\xd5\x02\xaa\xbb");
+
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .extension);
+    try std.testing.expectEqual(@as(i8, 2), obj.extension.type);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xaa, 0xbb }, obj.extension.data);
+}
+
+test "Unpacker: fixext 4 (0xd6)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xd6, type 0x03, data 4 bytes
+    try unpacker.feed("\xd6\x03\x01\x02\x03\x04");
+
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .extension);
+    try std.testing.expectEqual(@as(i8, 3), obj.extension.type);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4 }, obj.extension.data);
+}
+
+test "Unpacker: fixext 8 (0xd7)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xd7, type 0x04, data 8 bytes
+    try unpacker.feed("\xd7\x04\x01\x02\x03\x04\x05\x06\x07\x08");
+
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .extension);
+    try std.testing.expectEqual(@as(i8, 4), obj.extension.type);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 }, obj.extension.data);
+}
+
+test "Unpacker: fixext 16 (0xd8)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xd8, type 0x05, data 16 bytes
+    try unpacker.feed("\xd8\x05" ++ ("\x42" ** 16));
+
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .extension);
+    try std.testing.expectEqual(@as(i8, 5), obj.extension.type);
+    try std.testing.expectEqualSlices(u8, "\x42" ** 16, obj.extension.data);
+}
+
+test "Unpacker: ext 8 (0xc7)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xc7, length 3, type 10 (0x0a), data 3 bytes
+    try unpacker.feed("\xc7\x03\x0a\x01\x02\x03");
+
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .extension);
+    try std.testing.expectEqual(@as(i8, 10), obj.extension.type);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3 }, obj.extension.data);
+}
+
+test "Unpacker: ext 16 (0xc8)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xc8, length 2 (0x0002), type 11 (0x0b), data 2 bytes
+    try unpacker.feed("\xc8\x00\x02\x0b\xde\xad");
+
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .extension);
+    try std.testing.expectEqual(@as(i8, 11), obj.extension.type);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xde, 0xad }, obj.extension.data);
+}
+
+test "Unpacker: ext 32 (0xc9)" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 128 });
+    defer unpacker.deinit();
+
+    // 0xc9, length 1 (0x00000001), type 12 (0x0c), data 1 byte
+    try unpacker.feed("\xc9\x00\x00\x00\x01\x0c\xff");
+
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .extension);
+    try std.testing.expectEqual(@as(i8, 12), obj.extension.type);
+    try std.testing.expectEqualSlices(u8, &[_]u8{0xff}, obj.extension.data);
+}
+
 
 
