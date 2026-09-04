@@ -34,7 +34,7 @@ pub const MsgPackMapEntry = struct {
     value: MsgPackObject,
 };
 
-pub const Extension = struct {
+pub const MsgPackExtension = struct {
     type: i8,
     data: []u8,
 };
@@ -64,7 +64,7 @@ pub const MsgPackObject = union(MsgPackType) {
     binary: []u8,
     array: []MsgPackObject,
     map: []MsgPackMapEntry,
-    extension: Extension,
+    extension: MsgPackExtension,
 };
 
 pub fn freeObject(allocator: std.mem.Allocator, obj: MsgPackObject) void {
@@ -262,6 +262,37 @@ pub const Unpacker = struct {
 
                 return MsgPackObject{ .binary = bin };
             },
+
+            // fixext 1
+            0xd4 => {
+                const ext_type = @as(i8, @bitCast(try self.getNext()));
+                const length = try self.getNext();
+                const bin = try self.allocator.alloc(u8, length);
+                errdefer self.allocator.free(bin);
+
+                for (0..length) |i| {
+                    bin[i] = try self.ring.get();
+                }
+                const ext = MsgPackExtension{.type = ext_type, .data = bin};
+                return MsgPackObject{ .extension = ext };
+            },
+
+            // fixext 2
+            0xd5 => {
+                const ext_type = @as(i8, @bitCast(try self.getNext()));
+                const l1 = try self.getNext();
+                const l2 = try self.getNext();
+                const length = std.mem.readInt(u16, &[2]u8{ l1, l2 }, .big);
+                const bin = try self.allocator.alloc(u8, length);
+                errdefer self.allocator.free(bin);
+
+                for (0..length) |i| {
+                    bin[i] = try self.ring.get();
+                }
+                const ext = MsgPackExtension{.type = ext_type, .data = bin};
+                return MsgPackObject{ .extension = ext };
+            },
+            
 
             // Unhandled formats for this stage
             else => MsgPackError.Incomplete,
