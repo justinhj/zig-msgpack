@@ -231,6 +231,38 @@ pub const Unpacker = struct {
                 return MsgPackObject{ .binary = bin };
             },
 
+            // bin 16
+            0xc5 => {
+                const l1 = try self.getNext();
+                const l2 = try self.getNext();
+                const length = std.mem.readInt(u16, &[2]u8{ l1, l2 }, .big);
+                const bin = try self.allocator.alloc(u8, length);
+                errdefer self.allocator.free(bin);
+
+                for (0..length) |i| {
+                    bin[i] = try self.ring.get();
+                }
+
+                return MsgPackObject{ .binary = bin };
+            },
+
+            // bin 32
+            0xc6 => {
+                const l1 = try self.getNext();
+                const l2 = try self.getNext();
+                const l3 = try self.getNext();
+                const l4 = try self.getNext();
+                const length = std.mem.readInt(u32, &[4]u8{ l1, l2, l3, l4 }, .big);
+                const bin = try self.allocator.alloc(u8, length);
+                errdefer self.allocator.free(bin);
+
+                for (0..length) |i| {
+                    bin[i] = try self.ring.get();
+                }
+
+                return MsgPackObject{ .binary = bin };
+            },
+
             // Unhandled formats for this stage
             else => MsgPackError.Incomplete,
         };
