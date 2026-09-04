@@ -29,7 +29,7 @@ pub fn main(init: std.process.Init) !void {
 const RingBuffer = zig_msgpack.RingBuffer;
 const RingBufferError = zig_msgpack.RingBufferError;
 
-pub const MapEntry = struct {
+pub const MsgPackMapEntry = struct {
     key: MsgPackObject,
     value: MsgPackObject,
 };
@@ -63,7 +63,7 @@ pub const MsgPackObject = union(MsgPackType) {
     string: []u8,
     binary: []u8,
     array: []MsgPackObject,
-    map: []MapEntry,
+    map: []MsgPackMapEntry,
     extension: Extension,
 };
 
@@ -92,6 +92,7 @@ pub fn freeObject(allocator: std.mem.Allocator, obj: MsgPackObject) void {
 pub const MsgPackError = error{
     Incomplete, // If you run out of bytes while parsing
     NoMessage,
+    UsedNeverUsed,
 } || RingBufferError;
 
 pub const Unpacker = struct {
@@ -146,10 +147,25 @@ pub const Unpacker = struct {
         };
 
         return switch (next_char) {
-            // positive fixint: 0x00 - 0x7f (0xxxxxxx)
+            // positive fixint
             0x00...0x7f => MsgPackObject{ .integer = next_char },
 
-            // fixarray: 0x90 - 0x9f (1001xxxx)
+            // fixmap
+            0x80...0x8f => {
+                const item_count = next_char - 0x80;
+                const map = try self.allocator.alloc(MsgPackMapEntry, item_count);
+                var parsed: usize = 0;
+                while (parsed < item_count) : (parsed += 1) {
+                    const key = try self.parseObject();
+                    const value = try self.parseObject();
+                    const entry = MsgPackMapEntry{.key = key, .value = value};
+                    map[parsed] = entry;
+                }
+                return MsgPackObject{.map = map};
+
+            },  
+
+            // fixarray
             0x90...0x9f => {
                 const item_count = next_char - 0x90;
                 const array = try self.allocator.alloc(MsgPackObject, item_count);
@@ -167,6 +183,7 @@ pub const Unpacker = struct {
                 return MsgPackObject{ .array = array };
             },
 
+            // fixstr
             0xa0...0xbf => {
                 const length = next_char - 0xa0;
                 const str = try self.allocator.alloc(u8, length);
@@ -176,6 +193,26 @@ pub const Unpacker = struct {
                     str[i] = try self.ring.get();
                 }
                 return MsgPackObject{ .string = str };
+            },
+
+            // nil
+            0xc0 => {
+                return MsgPackObject{.nil = {}};
+            },
+
+            // (never used)
+            0xc1 => {
+                return MsgPackError.UsedNeverUsed;
+            },
+
+            // false
+            0xc2 => {
+                return MsgPackObject{.boolean = false};
+            },
+
+            // true
+            0xc3 => {
+                return MsgPackObject{.boolean = true};
             },
 
             // Unhandled formats for this stage
