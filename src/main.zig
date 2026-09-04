@@ -140,11 +140,15 @@ pub const Unpacker = struct {
         };
     }
 
-    fn parseObject(self: *Self) MsgPackError!MsgPackObject {
-        const next_char = self.ring.get() catch |err| switch (err) {
+    fn getNext(self: *Self) MsgPackError!u8 {
+        return self.ring.get() catch |err| switch (err) {
             error.EndOfBuffer => return MsgPackError.Incomplete,
             else => return err,
         };
+    }
+
+    fn parseObject(self: *Self) MsgPackError!MsgPackObject {
+        const next_char = try self.getNext();
 
         return switch (next_char) {
             // positive fixint
@@ -213,6 +217,18 @@ pub const Unpacker = struct {
             // true
             0xc3 => {
                 return MsgPackObject{.boolean = true};
+            },
+
+            // bin 8
+            0xc4 => {
+                const length = try self.getNext();
+                const bin = try self.allocator.alloc(u8, length);
+                errdefer self.allocator.free(bin);
+
+                for (0..length) |i| {
+                    bin[i] = try self.ring.get();
+                }
+                return MsgPackObject{ .binary = bin };
             },
 
             // Unhandled formats for this stage
