@@ -199,6 +199,48 @@ pub const Unpacker = struct {
                 return MsgPackObject{ .string = str };
             },
 
+            // str 8
+            0xd9 => {
+                const length = try self.ring.get();
+                const str = try self.allocator.alloc(u8, length);
+                errdefer self.allocator.free(str);
+
+                for (0..length) |i| {
+                    str[i] = try self.ring.get();
+                }
+                return MsgPackObject{ .string = str };
+            },
+
+            // str 16
+            0xda => {
+                const l1 = try self.getNext();
+                const l2 = try self.getNext();
+                const length = std.mem.readInt(u16, &[2]u8{ l1, l2 }, .big);
+                const str = try self.allocator.alloc(u8, length);
+                errdefer self.allocator.free(str);
+
+                for (0..length) |i| {
+                    str[i] = try self.ring.get();
+                }
+                return MsgPackObject{ .string = str };
+            },
+
+            // str 32
+            0xdb => {
+                const l1 = try self.getNext();
+                const l2 = try self.getNext();
+                const l3 = try self.getNext();
+                const l4 = try self.getNext();
+                const length = std.mem.readInt(u32, &[4]u8{ l1, l2, l3, l4 }, .big);
+                const str = try self.allocator.alloc(u8, length);
+                errdefer self.allocator.free(str);
+
+                for (0..length) |i| {
+                    str[i] = try self.ring.get();
+                }
+                return MsgPackObject{ .string = str };
+            },
+
             // nil
             0xc0 => {
                 return MsgPackObject{.nil = {}};
@@ -434,6 +476,44 @@ pub const Unpacker = struct {
                 const l8 = try self.getNext();
                 const val = std.mem.readInt(u64, &[8]u8{ l1, l2, l3, l4, l5, l6, l7, l8 }, .big);
                 return MsgPackObject{.unsigned_integer = val};
+            },
+
+            // int 8
+            0xd0 => {
+                const val = try self.getNext();
+                return MsgPackObject{.integer = val};
+            },
+
+            // int 16
+            0xd1 => {
+                const l1 = try self.getNext();
+                const l2 = try self.getNext();
+                const val = std.mem.readInt(i16, &[2]u8{ l1, l2 }, .big);
+                return MsgPackObject{.integer = val};
+            },
+
+            // int 32
+            0xd2 => {
+                const l1 = try self.getNext();
+                const l2 = try self.getNext();
+                const l3 = try self.getNext();
+                const l4 = try self.getNext();
+                const val = std.mem.readInt(i32, &[4]u8{ l1, l2, l3, l4 }, .big);
+                return MsgPackObject{.integer = val};
+            },
+
+            // int 64
+            0xd3 => {
+                const l1 = try self.getNext();
+                const l2 = try self.getNext();
+                const l3 = try self.getNext();
+                const l4 = try self.getNext();
+                const l5 = try self.getNext();
+                const l6 = try self.getNext();
+                const l7 = try self.getNext();
+                const l8 = try self.getNext();
+                const val = std.mem.readInt(i64, &[8]u8{ l1, l2, l3, l4, l5, l6, l7, l8 }, .big);
+                return MsgPackObject{.integer = val};
             },
 
             // Unhandled formats for this stage
