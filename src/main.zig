@@ -266,7 +266,44 @@ pub const Unpacker = struct {
             // fixext 1
             0xd4 => {
                 const ext_type = @as(i8, @bitCast(try self.getNext()));
+                const data = try self.ring.get();
+                const bin = try self.allocator.alloc(u8, 1);
+                bin[0] = data;
+                errdefer self.allocator.free(bin);
+                const ext = MsgPackExtension{.type = ext_type, .data = bin};
+                return MsgPackObject{ .extension = ext };
+            },
+
+            // fixext 2
+            0xd5 => {
+                const ext_type = @as(i8, @bitCast(try self.getNext()));
+                const bin = try self.allocator.alloc(u8, 2);
+                errdefer self.allocator.free(bin);
+
+                for (0..2) |i| {
+                    bin[i] = try self.ring.get();
+                }
+                const ext = MsgPackExtension{.type = ext_type, .data = bin};
+                return MsgPackObject{ .extension = ext };
+            },
+
+            // fixext 4
+            0xd6 => {
+                const ext_type = @as(i8, @bitCast(try self.getNext()));
+                const bin = try self.allocator.alloc(u8, 4);
+                errdefer self.allocator.free(bin);
+
+                for (0..4) |i| {
+                    bin[i] = try self.ring.get();
+                }
+                const ext = MsgPackExtension{.type = ext_type, .data = bin};
+                return MsgPackObject{ .extension = ext };
+            },
+
+            // ext 8
+            0xc7 => {
                 const length = try self.getNext();
+                const ext_type = @as(i8, @bitCast(try self.getNext()));
                 const bin = try self.allocator.alloc(u8, length);
                 errdefer self.allocator.free(bin);
 
@@ -277,12 +314,12 @@ pub const Unpacker = struct {
                 return MsgPackObject{ .extension = ext };
             },
 
-            // fixext 2
-            0xd5 => {
-                const ext_type = @as(i8, @bitCast(try self.getNext()));
+            // ext 16
+            0xc8 => {
                 const l1 = try self.getNext();
                 const l2 = try self.getNext();
                 const length = std.mem.readInt(u16, &[2]u8{ l1, l2 }, .big);
+                const ext_type = @as(i8, @bitCast(try self.getNext()));
                 const bin = try self.allocator.alloc(u8, length);
                 errdefer self.allocator.free(bin);
 
@@ -293,6 +330,24 @@ pub const Unpacker = struct {
                 return MsgPackObject{ .extension = ext };
             },
             
+            // ext 32
+            0xc9 => {
+                const l1 = try self.getNext();
+                const l2 = try self.getNext();
+                const l3 = try self.getNext();
+                const l4 = try self.getNext();
+                const length = std.mem.readInt(u32, &[4]u8{ l1, l2, l3, l4 }, .big);
+                const ext_type = @as(i8, @bitCast(try self.getNext()));
+                const bin = try self.allocator.alloc(u8, length);
+                errdefer self.allocator.free(bin);
+
+                for (0..length) |i| {
+                    bin[i] = try self.ring.get();
+                }
+                const ext = MsgPackExtension{.type = ext_type, .data = bin};
+                return MsgPackObject{ .extension = ext };
+            },
+
 
             // Unhandled formats for this stage
             else => MsgPackError.Incomplete,
