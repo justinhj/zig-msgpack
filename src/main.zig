@@ -154,6 +154,12 @@ pub const Unpacker = struct {
             // positive fixint
             0x00...0x7f => MsgPackObject{ .integer = next_char },
 
+            // negative fixint
+            0xe0...0xff => {
+                const val: i8 = @bitCast(next_char);
+                return MsgPackObject{ .integer = val };
+            },
+
             // fixmap
             0x80...0x8f => {
                 const item_count = next_char - 0x80;
@@ -169,6 +175,41 @@ pub const Unpacker = struct {
 
             },  
 
+            // map 16
+            0xde => {
+                const l1 = try self.getNext();
+                const l2 = try self.getNext();
+                const item_count = std.mem.readInt(u16, &[2]u8{ l1, l2 }, .big);
+                const map = try self.allocator.alloc(MsgPackMapEntry, item_count);
+                var parsed: usize = 0;
+                while (parsed < item_count) : (parsed += 1) {
+                    const key = try self.parseObject();
+                    const value = try self.parseObject();
+                    const entry = MsgPackMapEntry{.key = key, .value = value};
+                    map[parsed] = entry;
+                }
+                return MsgPackObject{.map = map};
+
+            },  
+
+            // map 32
+            0xdf => {
+                const l1 = try self.getNext();
+                const l2 = try self.getNext();
+                const l3 = try self.getNext();
+                const l4 = try self.getNext();
+                const item_count = std.mem.readInt(u32, &[4]u8{ l1, l2, l3, l4 }, .big);
+                const map = try self.allocator.alloc(MsgPackMapEntry, item_count);
+                var parsed: usize = 0;
+                while (parsed < item_count) : (parsed += 1) {
+                    const key = try self.parseObject();
+                    const value = try self.parseObject();
+                    const entry = MsgPackMapEntry{.key = key, .value = value};
+                    map[parsed] = entry;
+                }
+                return MsgPackObject{.map = map};
+
+            },  
             // fixarray
             0x90...0x9f => {
                 const item_count = next_char - 0x90;
@@ -182,6 +223,49 @@ pub const Unpacker = struct {
                 }
 
                 while (parsed < item_count) : (parsed += 1) {
+                    array[parsed] = try self.parseObject();
+                }
+                return MsgPackObject{ .array = array };
+            },
+
+
+            // array 16
+            0xdc => {
+                const l1 = try self.getNext();
+                const l2 = try self.getNext();
+                const length = std.mem.readInt(u16, &[2]u8{ l1, l2 }, .big);
+                const array = try self.allocator.alloc(MsgPackObject, length);
+                var parsed: usize = 0;
+                errdefer {
+                    for (array[0..parsed]) |item| {
+                        freeObject(self.allocator, item);
+                    }
+                    self.allocator.free(array);
+                }
+
+                while (parsed < length) : (parsed += 1) {
+                    array[parsed] = try self.parseObject();
+                }
+                return MsgPackObject{ .array = array };
+            },
+
+            // array 32
+            0xdd => {
+                const l1 = try self.getNext();
+                const l2 = try self.getNext();
+                const l3 = try self.getNext();
+                const l4 = try self.getNext();
+                const length = std.mem.readInt(u32, &[4]u8{ l1, l2, l3, l4 }, .big);
+                const array = try self.allocator.alloc(MsgPackObject, length);
+                var parsed: usize = 0;
+                errdefer {
+                    for (array[0..parsed]) |item| {
+                        freeObject(self.allocator, item);
+                    }
+                    self.allocator.free(array);
+                }
+
+                while (parsed < length) : (parsed += 1) {
                     array[parsed] = try self.parseObject();
                 }
                 return MsgPackObject{ .array = array };
@@ -450,7 +534,7 @@ pub const Unpacker = struct {
             0xcd => {
                 const l1 = try self.getNext();
                 const l2 = try self.getNext();
-                const val = std.mem.readInt(i16, &[2]u8{ l1, l2 }, .big);
+                const val = std.mem.readInt(u16, &[2]u8{ l1, l2 }, .big);
                 return MsgPackObject{.integer = val};
             },
 
@@ -480,7 +564,7 @@ pub const Unpacker = struct {
 
             // int 8
             0xd0 => {
-                const val = try self.getNext();
+                const val: i8 = @bitCast(try self.getNext());
                 return MsgPackObject{.integer = val};
             },
 
@@ -515,9 +599,6 @@ pub const Unpacker = struct {
                 const val = std.mem.readInt(i64, &[8]u8{ l1, l2, l3, l4, l5, l6, l7, l8 }, .big);
                 return MsgPackObject{.integer = val};
             },
-
-            // Unhandled formats for this stage
-            else => MsgPackError.Incomplete,
         };
     }
 };
