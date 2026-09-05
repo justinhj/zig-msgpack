@@ -95,6 +95,419 @@ pub const MsgPackError = error{
     UsedNeverUsed,
 } || RingBufferError;
 
+pub const SliceReader = struct {
+    buffer: []const u8,
+    pos: usize = 0,
+
+    pub fn readByte(self: *SliceReader) MsgPackError!u8 {
+        if (self.pos >= self.buffer.len) return MsgPackError.Incomplete;
+        const b = self.buffer[self.pos];
+        self.pos += 1;
+        return b;
+    }
+
+    pub fn readBytes(self: *SliceReader, dest: []u8) MsgPackError!void {
+        if (self.pos + dest.len > self.buffer.len) return MsgPackError.Incomplete;
+        @memcpy(dest, self.buffer[self.pos .. self.pos + dest.len]);
+        self.pos += dest.len;
+    }
+
+    pub fn readInt(self: *SliceReader, comptime T: type, endian: std.builtin.Endian) MsgPackError!T {
+        const size = @sizeOf(T);
+        if (self.pos + size > self.buffer.len) return MsgPackError.Incomplete;
+        const val = std.mem.readInt(T, self.buffer[self.pos .. self.pos + size][0..size], endian);
+        self.pos += size;
+        return val;
+    }
+};
+
+pub const RingReader = struct {
+    ring: *RingBuffer,
+
+    pub fn readByte(self: *RingReader) MsgPackError!u8 {
+        return self.ring.get() catch |err| switch (err) {
+            error.EndOfBuffer => return MsgPackError.Incomplete,
+            else => return err,
+        };
+    }
+
+    pub fn readBytes(self: *RingReader, dest: []u8) MsgPackError!void {
+        return self.ring.readBytes(dest) catch |err| switch (err) {
+            error.EndOfBuffer => return MsgPackError.Incomplete,
+            else => return err,
+        };
+    }
+
+    pub fn readInt(self: *RingReader, comptime T: type, endian: std.builtin.Endian) MsgPackError!T {
+        const size = @sizeOf(T);
+        var buf: [size]u8 = undefined;
+        try self.readBytes(&buf);
+        return std.mem.readInt(T, &buf, endian);
+    }
+};
+
+pub fn Parser(comptime Source: type) type {
+    return struct {
+        const Self = @This();
+        source: *Source,
+        allocator: std.mem.Allocator,
+
+        pub fn parseObject(self: *Self) MsgPackError!MsgPackObject {
+            const next_char = try self.source.readByte();
+
+            return switch (next_char) {
+                // positive fixint
+                0x00...0x7f => MsgPackObject{ .integer = next_char },
+
+                // negative fixint
+                0xe0...0xff => {
+                    const val: i8 = @bitCast(next_char);
+                    return MsgPackObject{ .integer = val };
+                },
+
+                // fixmap
+                0x80...0x8f => {
+                    const item_count = next_char - 0x80;
+                    const map = try self.allocator.alloc(MsgPackMapEntry, item_count);
+                    var parsed: usize = 0;
+                    errdefer {
+                        for (map[0..parsed]) |entry| {
+                            freeObject(self.allocator, entry.key);
+                            freeObject(self.allocator, entry.value);
+                        }
+                        self.allocator.free(map);
+                    }
+                    while (parsed < item_count) : (parsed += 1) {
+                        const key = try self.parseObject();
+                        errdefer freeObject(self.allocator, key);
+                        const value = try self.parseObject();
+                        map[parsed] = MsgPackMapEntry{ .key = key, .value = value };
+                    }
+                    return MsgPackObject{ .map = map };
+                },
+
+                // map 16
+                0xde => {
+                    const item_count = try self.source.readInt(u16, .big);
+                    const map = try self.allocator.alloc(MsgPackMapEntry, item_count);
+                    var parsed: usize = 0;
+                    errdefer {
+                        for (map[0..parsed]) |entry| {
+                            freeObject(self.allocator, entry.key);
+                            freeObject(self.allocator, entry.value);
+                        }
+                        self.allocator.free(map);
+                    }
+                    while (parsed < item_count) : (parsed += 1) {
+                        const key = try self.parseObject();
+                        errdefer freeObject(self.allocator, key);
+                        const value = try self.parseObject();
+                        map[parsed] = MsgPackMapEntry{ .key = key, .value = value };
+                    }
+                    return MsgPackObject{ .map = map };
+                },
+
+                // map 32
+                0xdf => {
+                    const item_count = try self.source.readInt(u32, .big);
+                    const map = try self.allocator.alloc(MsgPackMapEntry, item_count);
+                    var parsed: usize = 0;
+                    errdefer {
+                        for (map[0..parsed]) |entry| {
+                            freeObject(self.allocator, entry.key);
+                            freeObject(self.allocator, entry.value);
+                        }
+                        self.allocator.free(map);
+                    }
+                    while (parsed < item_count) : (parsed += 1) {
+                        const key = try self.parseObject();
+                        errdefer freeObject(self.allocator, key);
+                        const value = try self.parseObject();
+                        map[parsed] = MsgPackMapEntry{ .key = key, .value = value };
+                    }
+                    return MsgPackObject{ .map = map };
+                },
+
+                // fixarray
+                0x90...0x9f => {
+                    const item_count = next_char - 0x90;
+                    const array = try self.allocator.alloc(MsgPackObject, item_count);
+                    var parsed: usize = 0;
+                    errdefer {
+                        for (array[0..parsed]) |item| {
+                            freeObject(self.allocator, item);
+                        }
+                        self.allocator.free(array);
+                    }
+
+                    while (parsed < item_count) : (parsed += 1) {
+                        array[parsed] = try self.parseObject();
+                    }
+                    return MsgPackObject{ .array = array };
+                },
+
+                // array 16
+                0xdc => {
+                    const length = try self.source.readInt(u16, .big);
+                    const array = try self.allocator.alloc(MsgPackObject, length);
+                    var parsed: usize = 0;
+                    errdefer {
+                        for (array[0..parsed]) |item| {
+                            freeObject(self.allocator, item);
+                        }
+                        self.allocator.free(array);
+                    }
+
+                    while (parsed < length) : (parsed += 1) {
+                        array[parsed] = try self.parseObject();
+                    }
+                    return MsgPackObject{ .array = array };
+                },
+
+                // array 32
+                0xdd => {
+                    const length = try self.source.readInt(u32, .big);
+                    const array = try self.allocator.alloc(MsgPackObject, length);
+                    var parsed: usize = 0;
+                    errdefer {
+                        for (array[0..parsed]) |item| {
+                            freeObject(self.allocator, item);
+                        }
+                        self.allocator.free(array);
+                    }
+
+                    while (parsed < length) : (parsed += 1) {
+                        array[parsed] = try self.parseObject();
+                    }
+                    return MsgPackObject{ .array = array };
+                },
+
+                // fixstr
+                0xa0...0xbf => {
+                    const length = next_char - 0xa0;
+                    const str = try self.allocator.alloc(u8, length);
+                    errdefer self.allocator.free(str);
+                    try self.source.readBytes(str);
+                    return MsgPackObject{ .string = str };
+                },
+
+                // str 8
+                0xd9 => {
+                    const length = try self.source.readByte();
+                    const str = try self.allocator.alloc(u8, length);
+                    errdefer self.allocator.free(str);
+                    try self.source.readBytes(str);
+                    return MsgPackObject{ .string = str };
+                },
+
+                // str 16
+                0xda => {
+                    const length = try self.source.readInt(u16, .big);
+                    const str = try self.allocator.alloc(u8, length);
+                    errdefer self.allocator.free(str);
+                    try self.source.readBytes(str);
+                    return MsgPackObject{ .string = str };
+                },
+
+                // str 32
+                0xdb => {
+                    const length = try self.source.readInt(u32, .big);
+                    const str = try self.allocator.alloc(u8, length);
+                    errdefer self.allocator.free(str);
+                    try self.source.readBytes(str);
+                    return MsgPackObject{ .string = str };
+                },
+
+                // nil
+                0xc0 => {
+                    return MsgPackObject{ .nil = {} };
+                },
+
+                // (never used)
+                0xc1 => {
+                    return MsgPackError.UsedNeverUsed;
+                },
+
+                // false
+                0xc2 => {
+                    return MsgPackObject{ .boolean = false };
+                },
+
+                // true
+                0xc3 => {
+                    return MsgPackObject{ .boolean = true };
+                },
+
+                // bin 8
+                0xc4 => {
+                    const length = try self.source.readByte();
+                    const bin = try self.allocator.alloc(u8, length);
+                    errdefer self.allocator.free(bin);
+                    try self.source.readBytes(bin);
+                    return MsgPackObject{ .binary = bin };
+                },
+
+                // bin 16
+                0xc5 => {
+                    const length = try self.source.readInt(u16, .big);
+                    const bin = try self.allocator.alloc(u8, length);
+                    errdefer self.allocator.free(bin);
+                    try self.source.readBytes(bin);
+                    return MsgPackObject{ .binary = bin };
+                },
+
+                // bin 32
+                0xc6 => {
+                    const length = try self.source.readInt(u32, .big);
+                    const bin = try self.allocator.alloc(u8, length);
+                    errdefer self.allocator.free(bin);
+                    try self.source.readBytes(bin);
+                    return MsgPackObject{ .binary = bin };
+                },
+
+                // fixext 1
+                0xd4 => {
+                    const ext_type: i8 = @bitCast(try self.source.readByte());
+                    const bin = try self.allocator.alloc(u8, 1);
+                    errdefer self.allocator.free(bin);
+                    try self.source.readBytes(bin);
+                    return MsgPackObject{ .extension = MsgPackExtension{ .type = ext_type, .data = bin } };
+                },
+
+                // fixext 2
+                0xd5 => {
+                    const ext_type: i8 = @bitCast(try self.source.readByte());
+                    const bin = try self.allocator.alloc(u8, 2);
+                    errdefer self.allocator.free(bin);
+                    try self.source.readBytes(bin);
+                    return MsgPackObject{ .extension = MsgPackExtension{ .type = ext_type, .data = bin } };
+                },
+
+                // fixext 4
+                0xd6 => {
+                    const ext_type: i8 = @bitCast(try self.source.readByte());
+                    const bin = try self.allocator.alloc(u8, 4);
+                    errdefer self.allocator.free(bin);
+                    try self.source.readBytes(bin);
+                    return MsgPackObject{ .extension = MsgPackExtension{ .type = ext_type, .data = bin } };
+                },
+
+                // fixext 8
+                0xd7 => {
+                    const ext_type: i8 = @bitCast(try self.source.readByte());
+                    const bin = try self.allocator.alloc(u8, 8);
+                    errdefer self.allocator.free(bin);
+                    try self.source.readBytes(bin);
+                    return MsgPackObject{ .extension = MsgPackExtension{ .type = ext_type, .data = bin } };
+                },
+
+                // fixext 16
+                0xd8 => {
+                    const ext_type: i8 = @bitCast(try self.source.readByte());
+                    const bin = try self.allocator.alloc(u8, 16);
+                    errdefer self.allocator.free(bin);
+                    try self.source.readBytes(bin);
+                    return MsgPackObject{ .extension = MsgPackExtension{ .type = ext_type, .data = bin } };
+                },
+
+                // ext 8
+                0xc7 => {
+                    const length = try self.source.readByte();
+                    const ext_type: i8 = @bitCast(try self.source.readByte());
+                    const bin = try self.allocator.alloc(u8, length);
+                    errdefer self.allocator.free(bin);
+                    try self.source.readBytes(bin);
+                    return MsgPackObject{ .extension = MsgPackExtension{ .type = ext_type, .data = bin } };
+                },
+
+                // ext 16
+                0xc8 => {
+                    const length = try self.source.readInt(u16, .big);
+                    const ext_type: i8 = @bitCast(try self.source.readByte());
+                    const bin = try self.allocator.alloc(u8, length);
+                    errdefer self.allocator.free(bin);
+                    try self.source.readBytes(bin);
+                    return MsgPackObject{ .extension = MsgPackExtension{ .type = ext_type, .data = bin } };
+                },
+
+                // ext 32
+                0xc9 => {
+                    const length = try self.source.readInt(u32, .big);
+                    const ext_type: i8 = @bitCast(try self.source.readByte());
+                    const bin = try self.allocator.alloc(u8, length);
+                    errdefer self.allocator.free(bin);
+                    try self.source.readBytes(bin);
+                    return MsgPackObject{ .extension = MsgPackExtension{ .type = ext_type, .data = bin } };
+                },
+
+                // float 32
+                0xca => {
+                    const val: f32 = @bitCast(try self.source.readInt(u32, .big));
+                    return MsgPackObject{ .float32 = val };
+                },
+
+                // float 64
+                0xcb => {
+                    const val: f64 = @bitCast(try self.source.readInt(u64, .big));
+                    return MsgPackObject{ .float64 = val };
+                },
+
+                // uint 8
+                0xcc => {
+                    const val = try self.source.readByte();
+                    return MsgPackObject{ .integer = val };
+                },
+
+                // uint 16
+                0xcd => {
+                    const val = try self.source.readInt(u16, .big);
+                    return MsgPackObject{ .integer = val };
+                },
+
+                // uint 32
+                0xce => {
+                    const val = try self.source.readInt(u32, .big);
+                    return MsgPackObject{ .integer = val };
+                },
+
+                // uint 64
+                0xcf => {
+                    const val = try self.source.readInt(u64, .big);
+                    if (val > std.math.maxInt(i64)) {
+                        return MsgPackObject{ .unsigned_integer = val };
+                    } else {
+                        return MsgPackObject{ .integer = @intCast(val) };
+                    }
+                },
+
+                // int 8
+                0xd0 => {
+                    const val: i8 = @bitCast(try self.source.readByte());
+                    return MsgPackObject{ .integer = val };
+                },
+
+                // int 16
+                0xd1 => {
+                    const val = try self.source.readInt(i16, .big);
+                    return MsgPackObject{ .integer = val };
+                },
+
+                // int 32
+                0xd2 => {
+                    const val = try self.source.readInt(i32, .big);
+                    return MsgPackObject{ .integer = val };
+                },
+
+                // int 64
+                0xd3 => {
+                    const val = try self.source.readInt(i64, .big);
+                    return MsgPackObject{ .integer = val };
+                },
+            };
+        }
+    };
+}
+
 pub const Unpacker = struct {
     pub const Options = struct {
         max_buffer_size: usize = 1024 * 1024, // 1MB default
@@ -121,7 +534,6 @@ pub const Unpacker = struct {
     }
 
     pub fn next(self: *Self) MsgPackError!MsgPackObject {
-        // When the buffer is empty
         if (self.ring.count == 0) {
             return MsgPackError.NoMessage;
         }
@@ -129,9 +541,11 @@ pub const Unpacker = struct {
         const saved_start = self.ring.start;
         const saved_count = self.ring.count;
 
-        return self.parseObject() catch |err| switch (err) {
+        var reader = RingReader{ .ring = &self.ring };
+        var parser = Parser(RingReader){ .source = &reader, .allocator = self.allocator };
+
+        return parser.parseObject() catch |err| switch (err) {
             error.EndOfBuffer, error.Incomplete => {
-                // Restore ring buffer state so next feed can resume
                 self.ring.start = saved_start;
                 self.ring.count = saved_count;
                 return MsgPackError.Incomplete;
@@ -139,469 +553,15 @@ pub const Unpacker = struct {
             else => return err,
         };
     }
-
-    fn getNext(self: *Self) MsgPackError!u8 {
-        return self.ring.get() catch |err| switch (err) {
-            error.EndOfBuffer => return MsgPackError.Incomplete,
-            else => return err,
-        };
-    }
-
-    fn parseObject(self: *Self) MsgPackError!MsgPackObject {
-        const next_char = try self.getNext();
-
-        return switch (next_char) {
-            // positive fixint
-            0x00...0x7f => MsgPackObject{ .integer = next_char },
-
-            // negative fixint
-            0xe0...0xff => {
-                const val: i8 = @bitCast(next_char);
-                return MsgPackObject{ .integer = val };
-            },
-
-            // fixmap
-            0x80...0x8f => {
-                const item_count = next_char - 0x80;
-                const map = try self.allocator.alloc(MsgPackMapEntry, item_count);
-                var parsed: usize = 0;
-                while (parsed < item_count) : (parsed += 1) {
-                    const key = try self.parseObject();
-                    const value = try self.parseObject();
-                    const entry = MsgPackMapEntry{.key = key, .value = value};
-                    map[parsed] = entry;
-                }
-                return MsgPackObject{.map = map};
-
-            },  
-
-            // map 16
-            0xde => {
-                const l1 = try self.getNext();
-                const l2 = try self.getNext();
-                const item_count = std.mem.readInt(u16, &[2]u8{ l1, l2 }, .big);
-                const map = try self.allocator.alloc(MsgPackMapEntry, item_count);
-                var parsed: usize = 0;
-                while (parsed < item_count) : (parsed += 1) {
-                    const key = try self.parseObject();
-                    const value = try self.parseObject();
-                    const entry = MsgPackMapEntry{.key = key, .value = value};
-                    map[parsed] = entry;
-                }
-                return MsgPackObject{.map = map};
-
-            },  
-
-            // map 32
-            0xdf => {
-                const l1 = try self.getNext();
-                const l2 = try self.getNext();
-                const l3 = try self.getNext();
-                const l4 = try self.getNext();
-                const item_count = std.mem.readInt(u32, &[4]u8{ l1, l2, l3, l4 }, .big);
-                const map = try self.allocator.alloc(MsgPackMapEntry, item_count);
-                var parsed: usize = 0;
-                while (parsed < item_count) : (parsed += 1) {
-                    const key = try self.parseObject();
-                    const value = try self.parseObject();
-                    const entry = MsgPackMapEntry{.key = key, .value = value};
-                    map[parsed] = entry;
-                }
-                return MsgPackObject{.map = map};
-
-            },  
-            // fixarray
-            0x90...0x9f => {
-                const item_count = next_char - 0x90;
-                const array = try self.allocator.alloc(MsgPackObject, item_count);
-                var parsed: usize = 0;
-                errdefer {
-                    for (array[0..parsed]) |item| {
-                        freeObject(self.allocator, item);
-                    }
-                    self.allocator.free(array);
-                }
-
-                while (parsed < item_count) : (parsed += 1) {
-                    array[parsed] = try self.parseObject();
-                }
-                return MsgPackObject{ .array = array };
-            },
-
-
-            // array 16
-            0xdc => {
-                const l1 = try self.getNext();
-                const l2 = try self.getNext();
-                const length = std.mem.readInt(u16, &[2]u8{ l1, l2 }, .big);
-                const array = try self.allocator.alloc(MsgPackObject, length);
-                var parsed: usize = 0;
-                errdefer {
-                    for (array[0..parsed]) |item| {
-                        freeObject(self.allocator, item);
-                    }
-                    self.allocator.free(array);
-                }
-
-                while (parsed < length) : (parsed += 1) {
-                    array[parsed] = try self.parseObject();
-                }
-                return MsgPackObject{ .array = array };
-            },
-
-            // array 32
-            0xdd => {
-                const l1 = try self.getNext();
-                const l2 = try self.getNext();
-                const l3 = try self.getNext();
-                const l4 = try self.getNext();
-                const length = std.mem.readInt(u32, &[4]u8{ l1, l2, l3, l4 }, .big);
-                const array = try self.allocator.alloc(MsgPackObject, length);
-                var parsed: usize = 0;
-                errdefer {
-                    for (array[0..parsed]) |item| {
-                        freeObject(self.allocator, item);
-                    }
-                    self.allocator.free(array);
-                }
-
-                while (parsed < length) : (parsed += 1) {
-                    array[parsed] = try self.parseObject();
-                }
-                return MsgPackObject{ .array = array };
-            },
-
-            // fixstr
-            0xa0...0xbf => {
-                const length = next_char - 0xa0;
-                const str = try self.allocator.alloc(u8, length);
-                errdefer self.allocator.free(str);
-
-                for (0..length) |i| {
-                    str[i] = try self.ring.get();
-                }
-                return MsgPackObject{ .string = str };
-            },
-
-            // str 8
-            0xd9 => {
-                const length = try self.ring.get();
-                const str = try self.allocator.alloc(u8, length);
-                errdefer self.allocator.free(str);
-
-                for (0..length) |i| {
-                    str[i] = try self.ring.get();
-                }
-                return MsgPackObject{ .string = str };
-            },
-
-            // str 16
-            0xda => {
-                const l1 = try self.getNext();
-                const l2 = try self.getNext();
-                const length = std.mem.readInt(u16, &[2]u8{ l1, l2 }, .big);
-                const str = try self.allocator.alloc(u8, length);
-                errdefer self.allocator.free(str);
-
-                for (0..length) |i| {
-                    str[i] = try self.ring.get();
-                }
-                return MsgPackObject{ .string = str };
-            },
-
-            // str 32
-            0xdb => {
-                const l1 = try self.getNext();
-                const l2 = try self.getNext();
-                const l3 = try self.getNext();
-                const l4 = try self.getNext();
-                const length = std.mem.readInt(u32, &[4]u8{ l1, l2, l3, l4 }, .big);
-                const str = try self.allocator.alloc(u8, length);
-                errdefer self.allocator.free(str);
-
-                for (0..length) |i| {
-                    str[i] = try self.ring.get();
-                }
-                return MsgPackObject{ .string = str };
-            },
-
-            // nil
-            0xc0 => {
-                return MsgPackObject{.nil = {}};
-            },
-
-            // (never used)
-            0xc1 => {
-                return MsgPackError.UsedNeverUsed;
-            },
-
-            // false
-            0xc2 => {
-                return MsgPackObject{.boolean = false};
-            },
-
-            // true
-            0xc3 => {
-                return MsgPackObject{.boolean = true};
-            },
-
-            // bin 8
-            0xc4 => {
-                const length = try self.getNext();
-                const bin = try self.allocator.alloc(u8, length);
-                errdefer self.allocator.free(bin);
-
-                for (0..length) |i| {
-                    bin[i] = try self.ring.get();
-                }
-                return MsgPackObject{ .binary = bin };
-            },
-
-            // bin 16
-            0xc5 => {
-                const l1 = try self.getNext();
-                const l2 = try self.getNext();
-                const length = std.mem.readInt(u16, &[2]u8{ l1, l2 }, .big);
-                const bin = try self.allocator.alloc(u8, length);
-                errdefer self.allocator.free(bin);
-
-                for (0..length) |i| {
-                    bin[i] = try self.ring.get();
-                }
-
-                return MsgPackObject{ .binary = bin };
-            },
-
-            // bin 32
-            0xc6 => {
-                const l1 = try self.getNext();
-                const l2 = try self.getNext();
-                const l3 = try self.getNext();
-                const l4 = try self.getNext();
-                const length = std.mem.readInt(u32, &[4]u8{ l1, l2, l3, l4 }, .big);
-                const bin = try self.allocator.alloc(u8, length);
-                errdefer self.allocator.free(bin);
-
-                for (0..length) |i| {
-                    bin[i] = try self.ring.get();
-                }
-
-                return MsgPackObject{ .binary = bin };
-            },
-
-            // fixext 1
-            0xd4 => {
-                const ext_type = @as(i8, @bitCast(try self.getNext()));
-                const data = try self.ring.get();
-                const bin = try self.allocator.alloc(u8, 1);
-                bin[0] = data;
-                errdefer self.allocator.free(bin);
-                const ext = MsgPackExtension{.type = ext_type, .data = bin};
-                return MsgPackObject{ .extension = ext };
-            },
-
-            // fixext 2
-            0xd5 => {
-                const ext_type = @as(i8, @bitCast(try self.getNext()));
-                const bin = try self.allocator.alloc(u8, 2);
-                errdefer self.allocator.free(bin);
-
-                for (0..2) |i| {
-                    bin[i] = try self.ring.get();
-                }
-                const ext = MsgPackExtension{.type = ext_type, .data = bin};
-                return MsgPackObject{ .extension = ext };
-            },
-
-            // fixext 4
-            0xd6 => {
-                const ext_type = @as(i8, @bitCast(try self.getNext()));
-                const bin = try self.allocator.alloc(u8, 4);
-                errdefer self.allocator.free(bin);
-
-                for (0..4) |i| {
-                    bin[i] = try self.ring.get();
-                }
-                const ext = MsgPackExtension{.type = ext_type, .data = bin};
-                return MsgPackObject{ .extension = ext };
-            },
-
-            // fixext 8
-            0xd7 => {
-                const ext_type = @as(i8, @bitCast(try self.getNext()));
-                const bin = try self.allocator.alloc(u8, 8);
-                errdefer self.allocator.free(bin);
-
-                for (0..8) |i| {
-                    bin[i] = try self.ring.get();
-                }
-                const ext = MsgPackExtension{.type = ext_type, .data = bin};
-                return MsgPackObject{ .extension = ext };
-            },
-
-            // fixext 16
-            0xd8 => {
-                const ext_type = @as(i8, @bitCast(try self.getNext()));
-                const bin = try self.allocator.alloc(u8, 16);
-                errdefer self.allocator.free(bin);
-
-                for (0..16) |i| {
-                    bin[i] = try self.ring.get();
-                }
-                const ext = MsgPackExtension{.type = ext_type, .data = bin};
-                return MsgPackObject{ .extension = ext };
-            },
-
-            // ext 8
-            0xc7 => {
-                const length = try self.getNext();
-                const ext_type = @as(i8, @bitCast(try self.getNext()));
-                const bin = try self.allocator.alloc(u8, length);
-                errdefer self.allocator.free(bin);
-
-                for (0..length) |i| {
-                    bin[i] = try self.ring.get();
-                }
-                const ext = MsgPackExtension{.type = ext_type, .data = bin};
-                return MsgPackObject{ .extension = ext };
-            },
-
-            // ext 16
-            0xc8 => {
-                const l1 = try self.getNext();
-                const l2 = try self.getNext();
-                const length = std.mem.readInt(u16, &[2]u8{ l1, l2 }, .big);
-                const ext_type = @as(i8, @bitCast(try self.getNext()));
-                const bin = try self.allocator.alloc(u8, length);
-                errdefer self.allocator.free(bin);
-
-                for (0..length) |i| {
-                    bin[i] = try self.ring.get();
-                }
-                const ext = MsgPackExtension{.type = ext_type, .data = bin};
-                return MsgPackObject{ .extension = ext };
-            },
-            
-            // ext 32
-            0xc9 => {
-                const l1 = try self.getNext();
-                const l2 = try self.getNext();
-                const l3 = try self.getNext();
-                const l4 = try self.getNext();
-                const length = std.mem.readInt(u32, &[4]u8{ l1, l2, l3, l4 }, .big);
-                const ext_type = @as(i8, @bitCast(try self.getNext()));
-                const bin = try self.allocator.alloc(u8, length);
-                errdefer self.allocator.free(bin);
-
-                for (0..length) |i| {
-                    bin[i] = try self.ring.get();
-                }
-                const ext = MsgPackExtension{.type = ext_type, .data = bin};
-                return MsgPackObject{ .extension = ext };
-            },
-
-            // float 32
-            0xca => {
-                const l1 = try self.getNext();
-                const l2 = try self.getNext();
-                const l3 = try self.getNext();
-                const l4 = try self.getNext();
-                const val: f32 = @bitCast(std.mem.readInt(u32, &[4]u8{ l1, l2, l3, l4 }, .big));
-                return MsgPackObject{.float32 = val};
-            },
-
-            // float 64
-            0xcb => {
-                const l1 = try self.getNext();
-                const l2 = try self.getNext();
-                const l3 = try self.getNext();
-                const l4 = try self.getNext();
-                const l5 = try self.getNext();
-                const l6 = try self.getNext();
-                const l7 = try self.getNext();
-                const l8 = try self.getNext();
-                const val: f64 = @bitCast(std.mem.readInt(u64, &[8]u8{ l1, l2, l3, l4, l5, l6, l7, l8 }, .big));
-                return MsgPackObject{.float64 = val};
-            },
-
-            // uint 8
-            0xcc => {
-                const val = try self.getNext();
-                return MsgPackObject{.integer = val};
-            },
-
-            // uint 16
-            0xcd => {
-                const l1 = try self.getNext();
-                const l2 = try self.getNext();
-                const val = std.mem.readInt(u16, &[2]u8{ l1, l2 }, .big);
-                return MsgPackObject{.integer = val};
-            },
-
-            // uint 32
-            0xce => {
-                const l1 = try self.getNext();
-                const l2 = try self.getNext();
-                const l3 = try self.getNext();
-                const l4 = try self.getNext();
-                const val = std.mem.readInt(i32, &[4]u8{ l1, l2, l3, l4 }, .big);
-                return MsgPackObject{.integer = val};
-            },
-
-            // uint 64
-            0xcf => {
-                const l1 = try self.getNext();
-                const l2 = try self.getNext();
-                const l3 = try self.getNext();
-                const l4 = try self.getNext();
-                const l5 = try self.getNext();
-                const l6 = try self.getNext();
-                const l7 = try self.getNext();
-                const l8 = try self.getNext();
-                const val = std.mem.readInt(u64, &[8]u8{ l1, l2, l3, l4, l5, l6, l7, l8 }, .big);
-                return MsgPackObject{.unsigned_integer = val};
-            },
-
-            // int 8
-            0xd0 => {
-                const val: i8 = @bitCast(try self.getNext());
-                return MsgPackObject{.integer = val};
-            },
-
-            // int 16
-            0xd1 => {
-                const l1 = try self.getNext();
-                const l2 = try self.getNext();
-                const val = std.mem.readInt(i16, &[2]u8{ l1, l2 }, .big);
-                return MsgPackObject{.integer = val};
-            },
-
-            // int 32
-            0xd2 => {
-                const l1 = try self.getNext();
-                const l2 = try self.getNext();
-                const l3 = try self.getNext();
-                const l4 = try self.getNext();
-                const val = std.mem.readInt(i32, &[4]u8{ l1, l2, l3, l4 }, .big);
-                return MsgPackObject{.integer = val};
-            },
-
-            // int 64
-            0xd3 => {
-                const l1 = try self.getNext();
-                const l2 = try self.getNext();
-                const l3 = try self.getNext();
-                const l4 = try self.getNext();
-                const l5 = try self.getNext();
-                const l6 = try self.getNext();
-                const l7 = try self.getNext();
-                const l8 = try self.getNext();
-                const val = std.mem.readInt(i64, &[8]u8{ l1, l2, l3, l4, l5, l6, l7, l8 }, .big);
-                return MsgPackObject{.integer = val};
-            },
-        };
-    }
 };
+
+pub fn unpack(allocator: std.mem.Allocator, buffer: []const u8) MsgPackError!MsgPackObject {
+    if (buffer.len == 0) return MsgPackError.NoMessage;
+    var reader = SliceReader{ .buffer = buffer, .pos = 0 };
+    var parser = Parser(SliceReader){ .source = &reader, .allocator = allocator };
+    return parser.parseObject();
+}
+
 
 test "unpack command" {
     const gpa = std.testing.allocator;
@@ -1373,6 +1333,107 @@ test "Unpacker: ext 32 (0xc9)" {
     try std.testing.expectEqual(@as(i8, 12), obj.extension.type);
     try std.testing.expectEqualSlices(u8, &[_]u8{0xff}, obj.extension.data);
 }
+
+// =========================================================================
+// Tests for unpack() directly from contiguous user slices
+// =========================================================================
+
+test "unpack: empty buffer returns NoMessage" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.NoMessage, unpack(allocator, ""));
+}
+
+test "unpack: incomplete buffer returns Incomplete" {
+    const allocator = std.testing.allocator;
+    // 0x93 specifies array of 3 items, only 1 provided
+    try std.testing.expectError(error.Incomplete, unpack(allocator, "\x93\x01"));
+}
+
+test "unpack: basic types from contiguous slice" {
+    const allocator = std.testing.allocator;
+
+    // nil
+    {
+        const obj = try unpack(allocator, "\xc0");
+        defer freeObject(allocator, obj);
+        try std.testing.expect(obj == .nil);
+    }
+
+    // boolean true
+    {
+        const obj = try unpack(allocator, "\xc3");
+        defer freeObject(allocator, obj);
+        try std.testing.expect(obj == .boolean);
+        try std.testing.expectEqual(true, obj.boolean);
+    }
+
+    // positive fixint
+    {
+        const obj = try unpack(allocator, "\x2a");
+        defer freeObject(allocator, obj);
+        try std.testing.expect(obj == .integer);
+        try std.testing.expectEqual(@as(i64, 42), obj.integer);
+    }
+
+    // negative fixint
+    {
+        const obj = try unpack(allocator, "\xff");
+        defer freeObject(allocator, obj);
+        try std.testing.expect(obj == .integer);
+        try std.testing.expectEqual(@as(i64, -1), obj.integer);
+    }
+
+    // float32 (2.5)
+    {
+        const obj = try unpack(allocator, "\xca\x40\x20\x00\x00");
+        defer freeObject(allocator, obj);
+        try std.testing.expect(obj == .float32);
+        try std.testing.expectEqual(@as(f32, 2.5), obj.float32);
+    }
+
+    // string
+    {
+        const obj = try unpack(allocator, "\xa5hello");
+        defer freeObject(allocator, obj);
+        try std.testing.expect(obj == .string);
+        try std.testing.expectEqualStrings("hello", obj.string);
+    }
+
+    // binary
+    {
+        const obj = try unpack(allocator, "\xc4\x03\x01\x02\x03");
+        defer freeObject(allocator, obj);
+        try std.testing.expect(obj == .binary);
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3 }, obj.binary);
+    }
+}
+
+test "unpack: complex array and map from contiguous slice" {
+    const allocator = std.testing.allocator;
+
+    // Outer array: [0, 1, "nvim_eval", ["2 + 2"]]
+    const test_input = "\x94\x00\x01\xa9nvim_eval\x91\xa52 + 2";
+    const obj = try unpack(allocator, test_input);
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .array);
+    try std.testing.expectEqual(@as(usize, 4), obj.array.len);
+    try std.testing.expectEqual(@as(i64, 0), obj.array[0].integer);
+    try std.testing.expectEqual(@as(i64, 1), obj.array[1].integer);
+    try std.testing.expectEqualStrings("nvim_eval", obj.array[2].string);
+    try std.testing.expectEqualStrings("2 + 2", obj.array[3].array[0].string);
+
+    // Map: {"key": 100}
+    const map_input = "\x81\xa3key\x64";
+    const map_obj = try unpack(allocator, map_input);
+    defer freeObject(allocator, map_obj);
+
+    try std.testing.expect(map_obj == .map);
+    try std.testing.expectEqual(@as(usize, 1), map_obj.map.len);
+    try std.testing.expectEqualStrings("key", map_obj.map[0].key.string);
+    try std.testing.expectEqual(@as(i64, 100), map_obj.map[0].value.integer);
+}
+
 
 
 

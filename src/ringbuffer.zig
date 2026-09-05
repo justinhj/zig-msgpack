@@ -86,6 +86,31 @@ pub const RingBuffer = struct {
         self.count += data.len;
         return;
     }
+
+    pub fn readBytes(self: *Self, dest: []u8) RingBufferError!void {
+        if (dest.len == 0) {
+            return;
+        }
+
+        if (self.count < dest.len) {
+            return RingBufferError.EndOfBuffer;
+        }
+
+        const remaining_space = self.buffer_size - self.start;
+        if (remaining_space < dest.len) {
+            // Wrap
+            const left_over = dest.len - remaining_space;
+            @memcpy(dest[0..remaining_space], self.buffer[self.start .. self.start + remaining_space]);
+            @memcpy(dest[remaining_space..dest.len], self.buffer[0..left_over]);
+            self.start = left_over;
+        } else {
+            // No wrap
+            @memcpy(dest, self.buffer[self.start .. self.start + dest.len]);
+            const new_start = self.start + dest.len;
+            self.start = if (new_start == self.buffer_size) 0 else new_start;
+        }
+        self.count -= dest.len;
+    }
 };
 
 test "RingBuffer: construction with 128-byte buffer" {
@@ -417,4 +442,64 @@ test "RingBuffer: peek followed by get" {
     try std.testing.expectError(error.EndOfBuffer, rb.peek());
     try std.testing.expectError(error.EndOfBuffer, rb.get());
 }
+
+test "RingBuffer.readBytes: empty read and error when not enough bytes" {
+    const allocator = std.testing.allocator;
+    var rb = try RingBuffer.init(allocator, .{ .max_buffer_size = 128 });
+    defer rb.deinit();
+
+    // 0-length read does nothing
+    var empty_buf: [0]u8 = undefined;
+    try rb.readBytes(&empty_buf);
+
+    // Reading from empty returns EndOfBuffer
+    var buf: [4]u8 = undefined;
+    try std.testing.expectError(error.EndOfBuffer, rb.readBytes(&buf));
+
+    // Feed 3 bytes, attempt to read 4
+    try rb.feed("123");
+    try std.testing.expectError(error.EndOfBuffer, rb.readBytes(&buf));
+}
+
+test "RingBuffer.readBytes: contiguous read without wrap" {
+    const allocator = std.testing.allocator;
+    var rb = try RingBuffer.init(allocator, .{ .max_buffer_size = 128 });
+    defer rb.deinit();
+
+    try rb.feed("Hello, World!");
+    var buf: [5]u8 = undefined;
+    try rb.readBytes(&buf);
+    try std.testing.expectEqualStrings("Hello", &buf);
+    try std.testing.expectEqual(@as(usize, 8), rb.count);
+    try std.testing.expectEqual(@as(usize, 5), rb.start);
+
+    var rest: [8]u8 = undefined;
+    try rb.readBytes(&rest);
+    try std.testing.expectEqualStrings(", World!", &rest);
+    try std.testing.expectEqual(@as(usize, 0), rb.count);
+    try std.testing.expectEqual(@as(usize, 13), rb.start);
+}
+
+test "RingBuffer.readBytes: wrap-around read across boundary" {
+    const allocator = std.testing.allocator;
+    var rb = try RingBuffer.init(allocator, .{ .max_buffer_size = 128 });
+    defer rb.deinit();
+
+    // Position start and end at 125
+    rb.start = 125;
+    rb.end = 125;
+    rb.count = 0;
+
+    // Feed 7 bytes: 3 bytes at [125..128], 4 bytes wrap to [0..4]
+    try rb.feed("ABCDEFG");
+    try std.testing.expectEqual(@as(usize, 7), rb.count);
+
+    // Read all 7 bytes via readBytes across the boundary
+    var dest: [7]u8 = undefined;
+    try rb.readBytes(&dest);
+    try std.testing.expectEqualStrings("ABCDEFG", &dest);
+    try std.testing.expectEqual(@as(usize, 0), rb.count);
+    try std.testing.expectEqual(@as(usize, 4), rb.start);
+}
+
 
