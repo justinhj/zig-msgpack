@@ -300,6 +300,32 @@ pub const Unpacker = struct {
                 return MsgPackObject{ .extension = ext };
             },
 
+            // fixext 8
+            0xd7 => {
+                const ext_type = @as(i8, @bitCast(try self.getNext()));
+                const bin = try self.allocator.alloc(u8, 8);
+                errdefer self.allocator.free(bin);
+
+                for (0..8) |i| {
+                    bin[i] = try self.ring.get();
+                }
+                const ext = MsgPackExtension{.type = ext_type, .data = bin};
+                return MsgPackObject{ .extension = ext };
+            },
+
+            // fixext 16
+            0xd8 => {
+                const ext_type = @as(i8, @bitCast(try self.getNext()));
+                const bin = try self.allocator.alloc(u8, 16);
+                errdefer self.allocator.free(bin);
+
+                for (0..16) |i| {
+                    bin[i] = try self.ring.get();
+                }
+                const ext = MsgPackExtension{.type = ext_type, .data = bin};
+                return MsgPackObject{ .extension = ext };
+            },
+
             // ext 8
             0xc7 => {
                 const length = try self.getNext();
@@ -348,6 +374,67 @@ pub const Unpacker = struct {
                 return MsgPackObject{ .extension = ext };
             },
 
+            // float 32
+            0xca => {
+                const l1 = try self.getNext();
+                const l2 = try self.getNext();
+                const l3 = try self.getNext();
+                const l4 = try self.getNext();
+                const val: f32 = @bitCast(std.mem.readInt(u32, &[4]u8{ l1, l2, l3, l4 }, .big));
+                return MsgPackObject{.float32 = val};
+            },
+
+            // float 64
+            0xcb => {
+                const l1 = try self.getNext();
+                const l2 = try self.getNext();
+                const l3 = try self.getNext();
+                const l4 = try self.getNext();
+                const l5 = try self.getNext();
+                const l6 = try self.getNext();
+                const l7 = try self.getNext();
+                const l8 = try self.getNext();
+                const val: f64 = @bitCast(std.mem.readInt(u64, &[8]u8{ l1, l2, l3, l4, l5, l6, l7, l8 }, .big));
+                return MsgPackObject{.float64 = val};
+            },
+
+            // uint 8
+            0xcc => {
+                const val = try self.getNext();
+                return MsgPackObject{.integer = val};
+            },
+
+            // uint 16
+            0xcd => {
+                const l1 = try self.getNext();
+                const l2 = try self.getNext();
+                const val = std.mem.readInt(i16, &[2]u8{ l1, l2 }, .big);
+                return MsgPackObject{.integer = val};
+            },
+
+            // uint 32
+            0xce => {
+                const l1 = try self.getNext();
+                const l2 = try self.getNext();
+                const l3 = try self.getNext();
+                const l4 = try self.getNext();
+                const val = std.mem.readInt(i32, &[4]u8{ l1, l2, l3, l4 }, .big);
+                return MsgPackObject{.integer = val};
+            },
+
+            // uint 64
+            0xcf => {
+                const l1 = try self.getNext();
+                const l2 = try self.getNext();
+                const l3 = try self.getNext();
+                const l4 = try self.getNext();
+                const l5 = try self.getNext();
+                const l6 = try self.getNext();
+                const l7 = try self.getNext();
+                const l8 = try self.getNext();
+                const val = std.mem.readInt(u64, &[8]u8{ l1, l2, l3, l4, l5, l6, l7, l8 }, .big);
+                return MsgPackObject{.unsigned_integer = val};
+            },
 
             // Unhandled formats for this stage
             else => MsgPackError.Incomplete,
