@@ -14,7 +14,9 @@ pub const MsgPackError = error{
     Incomplete, // If you run out of bytes while parsing
     NoMessage,
     UsedNeverUsed,
-} || RingBufferError;
+    MaxDepthExceeded,
+    InvalidFormat,
+} || RingBufferError || std.mem.Allocator.Error;
 
 pub const SliceReader = struct {
     buffer: []const u8,
@@ -31,6 +33,15 @@ pub const SliceReader = struct {
         if (self.pos + dest.len > self.buffer.len) return MsgPackError.Incomplete;
         @memcpy(dest, self.buffer[self.pos .. self.pos + dest.len]);
         self.pos += dest.len;
+    }
+
+    pub fn readAvailable(self: *SliceReader, dest: []u8) usize {
+        if (self.pos >= self.buffer.len) return 0;
+        const available = self.buffer.len - self.pos;
+        const n = @min(dest.len, available);
+        @memcpy(dest[0..n], self.buffer[self.pos .. self.pos + n]);
+        self.pos += n;
+        return n;
     }
 
     pub fn readInt(self: *SliceReader, comptime T: type, endian: std.builtin.Endian) MsgPackError!T {
@@ -59,6 +70,13 @@ pub const RingReader = struct {
         };
     }
 
+    pub fn readAvailable(self: *RingReader, dest: []u8) usize {
+        if (self.ring.count == 0) return 0;
+        const n = @min(dest.len, self.ring.count);
+        self.ring.readBytes(dest[0..n]) catch unreachable;
+        return n;
+    }
+
     pub fn readInt(self: *RingReader, comptime T: type, endian: std.builtin.Endian) MsgPackError!T {
         const size = @sizeOf(T);
         var buf: [size]u8 = undefined;
@@ -67,364 +85,493 @@ pub const RingReader = struct {
     }
 };
 
+pub const BlobKind = enum {
+    string,
+    binary,
+    extension,
+};
+
+pub const StepState = union(enum) {
+    tag: void,
+    scalar: struct {
+        tag: u8,
+        buf: [8]u8,
+        needed: u8,
+        len: u8,
+    },
+    ext_type: struct {
+        len: usize,
+    },
+    blob: struct {
+        kind: BlobKind,
+        ext_type: i8,
+        data: []u8,
+        offset: usize,
+    },
+};
+
+pub const ContainerFrame = struct {
+    pub const Kind = enum {
+        array,
+        map_key,
+        map_val,
+    };
+
+    kind: Kind,
+    count: usize,
+    total: usize,
+    items: union {
+        array: []MsgPackObject,
+        map: struct {
+            entries: []MsgPackMapEntry,
+            current_key: ?MsgPackObject,
+        },
+    },
+};
+
 pub fn Parser(comptime Source: type) type {
     return struct {
         const Self = @This();
+
+        pub const Options = struct {
+            max_depth: usize = 128,
+        };
+
         source: *Source,
         allocator: std.mem.Allocator,
+        options: Options = .{},
+        state: StepState = .{ .tag = {} },
+        stack: std.ArrayListUnmanaged(ContainerFrame) = .empty,
+
+        pub fn init(source: *Source, allocator: std.mem.Allocator, options: Options) Self {
+            return .{
+                .source = source,
+                .allocator = allocator,
+                .options = options,
+                .state = .{ .tag = {} },
+                .stack = .empty,
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.reset();
+            self.stack.deinit(self.allocator);
+        }
+
+        pub fn isIdle(self: *const Self) bool {
+            return self.state == .tag and self.stack.items.len == 0;
+        }
+
+        pub fn reset(self: *Self) void {
+            switch (self.state) {
+                .blob => |b| {
+                    self.allocator.free(b.data);
+                },
+                else => {},
+            }
+            self.state = .{ .tag = {} };
+
+            for (self.stack.items) |frame| {
+                switch (frame.kind) {
+                    .array => {
+                        for (frame.items.array[0..frame.count]) |item| {
+                            freeObject(self.allocator, item);
+                        }
+                        self.allocator.free(frame.items.array);
+                    },
+                    .map_key, .map_val => {
+                        for (frame.items.map.entries[0..frame.count]) |entry| {
+                            freeObject(self.allocator, entry.key);
+                            freeObject(self.allocator, entry.value);
+                        }
+                        if (frame.items.map.current_key) |k| {
+                            freeObject(self.allocator, k);
+                        }
+                        self.allocator.free(frame.items.map.entries);
+                    },
+                }
+            }
+            self.stack.clearRetainingCapacity();
+        }
 
         pub fn parseObject(self: *Self) MsgPackError!MsgPackObject {
-            const next_char = try self.source.readByte();
+            while (true) {
+                if (try self.step()) |obj| {
+                    return obj;
+                }
+            }
+        }
 
-            return switch (next_char) {
-                // positive fixint
-                0x00...0x7f => MsgPackObject{ .integer = next_char },
+        pub fn next(self: *Self) MsgPackError!?MsgPackObject {
+            return self.step();
+        }
 
-                // negative fixint
-                0xe0...0xff => {
-                    const val: i8 = @bitCast(next_char);
-                    return MsgPackObject{ .integer = val };
-                },
+        fn startBlob(self: *Self, kind: BlobKind, ext_type: i8, len: usize) MsgPackError!?MsgPackObject {
+            if (len == 0) {
+                const empty_data = self.allocator.alloc(u8, 0) catch |err| {
+                    self.reset();
+                    return err;
+                };
+                const obj = switch (kind) {
+                    .string => MsgPackObject{ .string = empty_data },
+                    .binary => MsgPackObject{ .binary = empty_data },
+                    .extension => MsgPackObject{ .extension = .{ .type = ext_type, .data = empty_data } },
+                };
+                return self.routeObject(obj);
+            }
 
-                // fixmap
-                0x80...0x8f => {
-                    const item_count = next_char - 0x80;
-                    const map = try self.allocator.alloc(MsgPackMapEntry, item_count);
-                    var parsed: usize = 0;
-                    errdefer {
-                        for (map[0..parsed]) |entry| {
-                            freeObject(self.allocator, entry.key);
-                            freeObject(self.allocator, entry.value);
-                        }
-                        self.allocator.free(map);
-                    }
-                    while (parsed < item_count) : (parsed += 1) {
-                        const key = try self.parseObject();
-                        errdefer freeObject(self.allocator, key);
-                        const value = try self.parseObject();
-                        map[parsed] = MsgPackMapEntry{ .key = key, .value = value };
-                    }
-                    return MsgPackObject{ .map = map };
-                },
+            const data = self.allocator.alloc(u8, len) catch |err| {
+                self.reset();
+                return err;
+            };
 
-                // map 16
-                0xde => {
-                    const item_count = try self.source.readInt(u16, .big);
-                    const map = try self.allocator.alloc(MsgPackMapEntry, item_count);
-                    var parsed: usize = 0;
-                    errdefer {
-                        for (map[0..parsed]) |entry| {
-                            freeObject(self.allocator, entry.key);
-                            freeObject(self.allocator, entry.value);
-                        }
-                        self.allocator.free(map);
-                    }
-                    while (parsed < item_count) : (parsed += 1) {
-                        const key = try self.parseObject();
-                        errdefer freeObject(self.allocator, key);
-                        const value = try self.parseObject();
-                        map[parsed] = MsgPackMapEntry{ .key = key, .value = value };
-                    }
-                    return MsgPackObject{ .map = map };
-                },
-
-                // map 32
-                0xdf => {
-                    const item_count = try self.source.readInt(u32, .big);
-                    const map = try self.allocator.alloc(MsgPackMapEntry, item_count);
-                    var parsed: usize = 0;
-                    errdefer {
-                        for (map[0..parsed]) |entry| {
-                            freeObject(self.allocator, entry.key);
-                            freeObject(self.allocator, entry.value);
-                        }
-                        self.allocator.free(map);
-                    }
-                    while (parsed < item_count) : (parsed += 1) {
-                        const key = try self.parseObject();
-                        errdefer freeObject(self.allocator, key);
-                        const value = try self.parseObject();
-                        map[parsed] = MsgPackMapEntry{ .key = key, .value = value };
-                    }
-                    return MsgPackObject{ .map = map };
-                },
-
-                // fixarray
-                0x90...0x9f => {
-                    const item_count = next_char - 0x90;
-                    const array = try self.allocator.alloc(MsgPackObject, item_count);
-                    var parsed: usize = 0;
-                    errdefer {
-                        for (array[0..parsed]) |item| {
-                            freeObject(self.allocator, item);
-                        }
-                        self.allocator.free(array);
-                    }
-
-                    while (parsed < item_count) : (parsed += 1) {
-                        array[parsed] = try self.parseObject();
-                    }
-                    return MsgPackObject{ .array = array };
-                },
-
-                // array 16
-                0xdc => {
-                    const length = try self.source.readInt(u16, .big);
-                    const array = try self.allocator.alloc(MsgPackObject, length);
-                    var parsed: usize = 0;
-                    errdefer {
-                        for (array[0..parsed]) |item| {
-                            freeObject(self.allocator, item);
-                        }
-                        self.allocator.free(array);
-                    }
-
-                    while (parsed < length) : (parsed += 1) {
-                        array[parsed] = try self.parseObject();
-                    }
-                    return MsgPackObject{ .array = array };
-                },
-
-                // array 32
-                0xdd => {
-                    const length = try self.source.readInt(u32, .big);
-                    const array = try self.allocator.alloc(MsgPackObject, length);
-                    var parsed: usize = 0;
-                    errdefer {
-                        for (array[0..parsed]) |item| {
-                            freeObject(self.allocator, item);
-                        }
-                        self.allocator.free(array);
-                    }
-
-                    while (parsed < length) : (parsed += 1) {
-                        array[parsed] = try self.parseObject();
-                    }
-                    return MsgPackObject{ .array = array };
-                },
-
-                // fixstr
-                0xa0...0xbf => {
-                    const length = next_char - 0xa0;
-                    const str = try self.allocator.alloc(u8, length);
-                    errdefer self.allocator.free(str);
-                    try self.source.readBytes(str);
-                    return MsgPackObject{ .string = str };
-                },
-
-                // str 8
-                0xd9 => {
-                    const length = try self.source.readByte();
-                    const str = try self.allocator.alloc(u8, length);
-                    errdefer self.allocator.free(str);
-                    try self.source.readBytes(str);
-                    return MsgPackObject{ .string = str };
-                },
-
-                // str 16
-                0xda => {
-                    const length = try self.source.readInt(u16, .big);
-                    const str = try self.allocator.alloc(u8, length);
-                    errdefer self.allocator.free(str);
-                    try self.source.readBytes(str);
-                    return MsgPackObject{ .string = str };
-                },
-
-                // str 32
-                0xdb => {
-                    const length = try self.source.readInt(u32, .big);
-                    const str = try self.allocator.alloc(u8, length);
-                    errdefer self.allocator.free(str);
-                    try self.source.readBytes(str);
-                    return MsgPackObject{ .string = str };
-                },
-
-                // nil
-                0xc0 => {
-                    return MsgPackObject{ .nil = {} };
-                },
-
-                // (never used)
-                0xc1 => {
-                    return MsgPackError.UsedNeverUsed;
-                },
-
-                // false
-                0xc2 => {
-                    return MsgPackObject{ .boolean = false };
-                },
-
-                // true
-                0xc3 => {
-                    return MsgPackObject{ .boolean = true };
-                },
-
-                // bin 8
-                0xc4 => {
-                    const length = try self.source.readByte();
-                    const bin = try self.allocator.alloc(u8, length);
-                    errdefer self.allocator.free(bin);
-                    try self.source.readBytes(bin);
-                    return MsgPackObject{ .binary = bin };
-                },
-
-                // bin 16
-                0xc5 => {
-                    const length = try self.source.readInt(u16, .big);
-                    const bin = try self.allocator.alloc(u8, length);
-                    errdefer self.allocator.free(bin);
-                    try self.source.readBytes(bin);
-                    return MsgPackObject{ .binary = bin };
-                },
-
-                // bin 32
-                0xc6 => {
-                    const length = try self.source.readInt(u32, .big);
-                    const bin = try self.allocator.alloc(u8, length);
-                    errdefer self.allocator.free(bin);
-                    try self.source.readBytes(bin);
-                    return MsgPackObject{ .binary = bin };
-                },
-
-                // fixext 1
-                0xd4 => {
-                    const ext_type: i8 = @bitCast(try self.source.readByte());
-                    const bin = try self.allocator.alloc(u8, 1);
-                    errdefer self.allocator.free(bin);
-                    try self.source.readBytes(bin);
-                    return MsgPackObject{ .extension = MsgPackExtension{ .type = ext_type, .data = bin } };
-                },
-
-                // fixext 2
-                0xd5 => {
-                    const ext_type: i8 = @bitCast(try self.source.readByte());
-                    const bin = try self.allocator.alloc(u8, 2);
-                    errdefer self.allocator.free(bin);
-                    try self.source.readBytes(bin);
-                    return MsgPackObject{ .extension = MsgPackExtension{ .type = ext_type, .data = bin } };
-                },
-
-                // fixext 4
-                0xd6 => {
-                    const ext_type: i8 = @bitCast(try self.source.readByte());
-                    const bin = try self.allocator.alloc(u8, 4);
-                    errdefer self.allocator.free(bin);
-                    try self.source.readBytes(bin);
-                    return MsgPackObject{ .extension = MsgPackExtension{ .type = ext_type, .data = bin } };
-                },
-
-                // fixext 8
-                0xd7 => {
-                    const ext_type: i8 = @bitCast(try self.source.readByte());
-                    const bin = try self.allocator.alloc(u8, 8);
-                    errdefer self.allocator.free(bin);
-                    try self.source.readBytes(bin);
-                    return MsgPackObject{ .extension = MsgPackExtension{ .type = ext_type, .data = bin } };
-                },
-
-                // fixext 16
-                0xd8 => {
-                    const ext_type: i8 = @bitCast(try self.source.readByte());
-                    const bin = try self.allocator.alloc(u8, 16);
-                    errdefer self.allocator.free(bin);
-                    try self.source.readBytes(bin);
-                    return MsgPackObject{ .extension = MsgPackExtension{ .type = ext_type, .data = bin } };
-                },
-
-                // ext 8
-                0xc7 => {
-                    const length = try self.source.readByte();
-                    const ext_type: i8 = @bitCast(try self.source.readByte());
-                    const bin = try self.allocator.alloc(u8, length);
-                    errdefer self.allocator.free(bin);
-                    try self.source.readBytes(bin);
-                    return MsgPackObject{ .extension = MsgPackExtension{ .type = ext_type, .data = bin } };
-                },
-
-                // ext 16
-                0xc8 => {
-                    const length = try self.source.readInt(u16, .big);
-                    const ext_type: i8 = @bitCast(try self.source.readByte());
-                    const bin = try self.allocator.alloc(u8, length);
-                    errdefer self.allocator.free(bin);
-                    try self.source.readBytes(bin);
-                    return MsgPackObject{ .extension = MsgPackExtension{ .type = ext_type, .data = bin } };
-                },
-
-                // ext 32
-                0xc9 => {
-                    const length = try self.source.readInt(u32, .big);
-                    const ext_type: i8 = @bitCast(try self.source.readByte());
-                    const bin = try self.allocator.alloc(u8, length);
-                    errdefer self.allocator.free(bin);
-                    try self.source.readBytes(bin);
-                    return MsgPackObject{ .extension = MsgPackExtension{ .type = ext_type, .data = bin } };
-                },
-
-                // float 32
-                0xca => {
-                    const val: f32 = @bitCast(try self.source.readInt(u32, .big));
-                    return MsgPackObject{ .float32 = val };
-                },
-
-                // float 64
-                0xcb => {
-                    const val: f64 = @bitCast(try self.source.readInt(u64, .big));
-                    return MsgPackObject{ .float64 = val };
-                },
-
-                // uint 8
-                0xcc => {
-                    const val = try self.source.readByte();
-                    return MsgPackObject{ .integer = val };
-                },
-
-                // uint 16
-                0xcd => {
-                    const val = try self.source.readInt(u16, .big);
-                    return MsgPackObject{ .integer = val };
-                },
-
-                // uint 32
-                0xce => {
-                    const val = try self.source.readInt(u32, .big);
-                    return MsgPackObject{ .integer = val };
-                },
-
-                // uint 64
-                0xcf => {
-                    const val = try self.source.readInt(u64, .big);
-                    if (val > std.math.maxInt(i64)) {
-                        return MsgPackObject{ .unsigned_integer = val };
-                    } else {
-                        return MsgPackObject{ .integer = @intCast(val) };
-                    }
-                },
-
-                // int 8
-                0xd0 => {
-                    const val: i8 = @bitCast(try self.source.readByte());
-                    return MsgPackObject{ .integer = val };
-                },
-
-                // int 16
-                0xd1 => {
-                    const val = try self.source.readInt(i16, .big);
-                    return MsgPackObject{ .integer = val };
-                },
-
-                // int 32
-                0xd2 => {
-                    const val = try self.source.readInt(i32, .big);
-                    return MsgPackObject{ .integer = val };
-                },
-
-                // int 64
-                0xd3 => {
-                    const val = try self.source.readInt(i64, .big);
-                    return MsgPackObject{ .integer = val };
+            self.state = .{
+                .blob = .{
+                    .kind = kind,
+                    .ext_type = ext_type,
+                    .data = data,
+                    .offset = 0,
                 },
             };
+            return null;
+        }
+
+        fn startArray(self: *Self, len: usize) MsgPackError!?MsgPackObject {
+            if (self.stack.items.len >= self.options.max_depth) {
+                self.reset();
+                return MsgPackError.MaxDepthExceeded;
+            }
+
+            const array = self.allocator.alloc(MsgPackObject, len) catch |err| {
+                self.reset();
+                return err;
+            };
+
+            if (len == 0) {
+                return self.routeObject(MsgPackObject{ .array = array });
+            }
+
+            self.stack.append(self.allocator, .{
+                .kind = .array,
+                .count = 0,
+                .total = len,
+                .items = .{ .array = array },
+            }) catch |err| {
+                self.allocator.free(array);
+                self.reset();
+                return err;
+            };
+
+            self.state = .{ .tag = {} };
+            return null;
+        }
+
+        fn startMap(self: *Self, len: usize) MsgPackError!?MsgPackObject {
+            if (self.stack.items.len >= self.options.max_depth) {
+                self.reset();
+                return MsgPackError.MaxDepthExceeded;
+            }
+
+            const map = self.allocator.alloc(MsgPackMapEntry, len) catch |err| {
+                self.reset();
+                return err;
+            };
+
+            if (len == 0) {
+                return self.routeObject(MsgPackObject{ .map = map });
+            }
+
+            self.stack.append(self.allocator, .{
+                .kind = .map_key,
+                .count = 0,
+                .total = len,
+                .items = .{ .map = .{ .entries = map, .current_key = null } },
+            }) catch |err| {
+                self.allocator.free(map);
+                self.reset();
+                return err;
+            };
+
+            self.state = .{ .tag = {} };
+            return null;
+        }
+
+        fn routeObject(self: *Self, object: MsgPackObject) MsgPackError!?MsgPackObject {
+            var curr = object;
+            while (self.stack.items.len > 0) {
+                var top = &self.stack.items[self.stack.items.len - 1];
+                switch (top.kind) {
+                    .array => {
+                        top.items.array[top.count] = curr;
+                        top.count += 1;
+                        if (top.count == top.total) {
+                            const completed_array = top.items.array;
+                            _ = self.stack.pop();
+                            curr = MsgPackObject{ .array = completed_array };
+                            continue;
+                        } else {
+                            self.state = .{ .tag = {} };
+                            return null;
+                        }
+                    },
+                    .map_key => {
+                        top.items.map.current_key = curr;
+                        top.kind = .map_val;
+                        self.state = .{ .tag = {} };
+                        return null;
+                    },
+                    .map_val => {
+                        const key = top.items.map.current_key.?;
+                        top.items.map.current_key = null;
+                        top.items.map.entries[top.count] = MsgPackMapEntry{ .key = key, .value = curr };
+                        top.count += 1;
+                        top.kind = .map_key;
+                        if (top.count == top.total) {
+                            const completed_map = top.items.map.entries;
+                            _ = self.stack.pop();
+                            curr = MsgPackObject{ .map = completed_map };
+                            continue;
+                        } else {
+                            self.state = .{ .tag = {} };
+                            return null;
+                        }
+                    },
+                }
+            }
+
+            self.state = .{ .tag = {} };
+            return curr;
+        }
+
+        fn step(self: *Self) MsgPackError!?MsgPackObject {
+            while (true) {
+                switch (self.state) {
+                    .tag => {
+                        const tag = try self.source.readByte();
+                        switch (tag) {
+                            // positive fixint
+                            0x00...0x7f => {
+                                if (try self.routeObject(MsgPackObject{ .integer = tag })) |obj| return obj;
+                            },
+                            // negative fixint
+                            0xe0...0xff => {
+                                const val: i8 = @bitCast(tag);
+                                if (try self.routeObject(MsgPackObject{ .integer = val })) |obj| return obj;
+                            },
+                            // nil
+                            0xc0 => {
+                                if (try self.routeObject(MsgPackObject{ .nil = {} })) |obj| return obj;
+                            },
+                            // (never used)
+                            0xc1 => {
+                                self.reset();
+                                return MsgPackError.UsedNeverUsed;
+                            },
+                            // false
+                            0xc2 => {
+                                if (try self.routeObject(MsgPackObject{ .boolean = false })) |obj| return obj;
+                            },
+                            // true
+                            0xc3 => {
+                                if (try self.routeObject(MsgPackObject{ .boolean = true })) |obj| return obj;
+                            },
+
+                            // fixmap
+                            0x80...0x8f => {
+                                const count = tag - 0x80;
+                                if (try self.startMap(count)) |obj| return obj;
+                            },
+                            // fixarray
+                            0x90...0x9f => {
+                                const count = tag - 0x90;
+                                if (try self.startArray(count)) |obj| return obj;
+                            },
+                            // fixstr
+                            0xa0...0xbf => {
+                                const len = tag - 0xa0;
+                                if (try self.startBlob(.string, 0, len)) |obj| return obj;
+                            },
+
+                            // uint 8 / int 8
+                            0xcc, 0xd0 => self.state = .{ .scalar = .{ .tag = tag, .needed = 1, .len = 0, .buf = undefined } },
+                            // uint 16 / int 16
+                            0xcd, 0xd1 => self.state = .{ .scalar = .{ .tag = tag, .needed = 2, .len = 0, .buf = undefined } },
+                            // uint 32 / int 32 / float 32
+                            0xce, 0xd2, 0xca => self.state = .{ .scalar = .{ .tag = tag, .needed = 4, .len = 0, .buf = undefined } },
+                            // uint 64 / int 64 / float 64
+                            0xcf, 0xd3, 0xcb => self.state = .{ .scalar = .{ .tag = tag, .needed = 8, .len = 0, .buf = undefined } },
+
+                            // str 8 / bin 8 / ext 8
+                            0xd9, 0xc4, 0xc7 => self.state = .{ .scalar = .{ .tag = tag, .needed = 1, .len = 0, .buf = undefined } },
+                            // str 16 / bin 16 / ext 16
+                            0xda, 0xc5, 0xc8 => self.state = .{ .scalar = .{ .tag = tag, .needed = 2, .len = 0, .buf = undefined } },
+                            // str 32 / bin 32 / ext 32
+                            0xdb, 0xc6, 0xc9 => self.state = .{ .scalar = .{ .tag = tag, .needed = 4, .len = 0, .buf = undefined } },
+
+                            // fixext 1, 2, 4, 8, 16
+                            0xd4 => self.state = .{ .ext_type = .{ .len = 1 } },
+                            0xd5 => self.state = .{ .ext_type = .{ .len = 2 } },
+                            0xd6 => self.state = .{ .ext_type = .{ .len = 4 } },
+                            0xd7 => self.state = .{ .ext_type = .{ .len = 8 } },
+                            0xd8 => self.state = .{ .ext_type = .{ .len = 16 } },
+
+                            // array 16 / map 16
+                            0xdc, 0xde => self.state = .{ .scalar = .{ .tag = tag, .needed = 2, .len = 0, .buf = undefined } },
+                            // array 32 / map 32
+                            0xdd, 0xdf => self.state = .{ .scalar = .{ .tag = tag, .needed = 4, .len = 0, .buf = undefined } },
+                        }
+                    },
+
+                    .scalar => |*s| {
+                        while (s.len < s.needed) {
+                            const b = try self.source.readByte();
+                            s.buf[s.len] = b;
+                            s.len += 1;
+                        }
+
+                        const tag = s.tag;
+                        const buf = s.buf;
+                        self.state = .{ .tag = {} };
+
+                        switch (tag) {
+                            0xcc => { // uint 8
+                                if (try self.routeObject(MsgPackObject{ .integer = buf[0] })) |obj| return obj;
+                            },
+                            0xcd => { // uint 16
+                                const val = std.mem.readInt(u16, buf[0..2], .big);
+                                if (try self.routeObject(MsgPackObject{ .integer = val })) |obj| return obj;
+                            },
+                            0xce => { // uint 32
+                                const val = std.mem.readInt(u32, buf[0..4], .big);
+                                if (try self.routeObject(MsgPackObject{ .integer = val })) |obj| return obj;
+                            },
+                            0xcf => { // uint 64
+                                const val = std.mem.readInt(u64, buf[0..8], .big);
+                                const obj = if (val > std.math.maxInt(i64))
+                                    MsgPackObject{ .unsigned_integer = val }
+                                else
+                                    MsgPackObject{ .integer = @intCast(val) };
+                                if (try self.routeObject(obj)) |res| return res;
+                            },
+                            0xd0 => { // int 8
+                                const val: i8 = @bitCast(buf[0]);
+                                if (try self.routeObject(MsgPackObject{ .integer = val })) |obj| return obj;
+                            },
+                            0xd1 => { // int 16
+                                const val = std.mem.readInt(i16, buf[0..2], .big);
+                                if (try self.routeObject(MsgPackObject{ .integer = val })) |obj| return obj;
+                            },
+                            0xd2 => { // int 32
+                                const val = std.mem.readInt(i32, buf[0..4], .big);
+                                if (try self.routeObject(MsgPackObject{ .integer = val })) |obj| return obj;
+                            },
+                            0xd3 => { // int 64
+                                const val = std.mem.readInt(i64, buf[0..8], .big);
+                                if (try self.routeObject(MsgPackObject{ .integer = val })) |obj| return obj;
+                            },
+                            0xca => { // float 32
+                                const val: f32 = @bitCast(std.mem.readInt(u32, buf[0..4], .big));
+                                if (try self.routeObject(MsgPackObject{ .float32 = val })) |obj| return obj;
+                            },
+                            0xcb => { // float 64
+                                const val: f64 = @bitCast(std.mem.readInt(u64, buf[0..8], .big));
+                                if (try self.routeObject(MsgPackObject{ .float64 = val })) |obj| return obj;
+                            },
+
+                            0xd9 => { // str 8
+                                const len = buf[0];
+                                if (try self.startBlob(.string, 0, len)) |obj| return obj;
+                            },
+                            0xda => { // str 16
+                                const len = std.mem.readInt(u16, buf[0..2], .big);
+                                if (try self.startBlob(.string, 0, len)) |obj| return obj;
+                            },
+                            0xdb => { // str 32
+                                const len = std.mem.readInt(u32, buf[0..4], .big);
+                                if (try self.startBlob(.string, 0, len)) |obj| return obj;
+                            },
+
+                            0xc4 => { // bin 8
+                                const len = buf[0];
+                                if (try self.startBlob(.binary, 0, len)) |obj| return obj;
+                            },
+                            0xc5 => { // bin 16
+                                const len = std.mem.readInt(u16, buf[0..2], .big);
+                                if (try self.startBlob(.binary, 0, len)) |obj| return obj;
+                            },
+                            0xc6 => { // bin 32
+                                const len = std.mem.readInt(u32, buf[0..4], .big);
+                                if (try self.startBlob(.binary, 0, len)) |obj| return obj;
+                            },
+
+                            0xc7 => { // ext 8
+                                const len = buf[0];
+                                self.state = .{ .ext_type = .{ .len = len } };
+                            },
+                            0xc8 => { // ext 16
+                                const len = std.mem.readInt(u16, buf[0..2], .big);
+                                self.state = .{ .ext_type = .{ .len = len } };
+                            },
+                            0xc9 => { // ext 32
+                                const len = std.mem.readInt(u32, buf[0..4], .big);
+                                self.state = .{ .ext_type = .{ .len = len } };
+                            },
+
+                            0xdc => { // array 16
+                                const len = std.mem.readInt(u16, buf[0..2], .big);
+                                if (try self.startArray(len)) |obj| return obj;
+                            },
+                            0xdd => { // array 32
+                                const len = std.mem.readInt(u32, buf[0..4], .big);
+                                if (try self.startArray(len)) |obj| return obj;
+                            },
+
+                            0xde => { // map 16
+                                const len = std.mem.readInt(u16, buf[0..2], .big);
+                                if (try self.startMap(len)) |obj| return obj;
+                            },
+                            0xdf => { // map 32
+                                const len = std.mem.readInt(u32, buf[0..4], .big);
+                                if (try self.startMap(len)) |obj| return obj;
+                            },
+
+                            else => unreachable,
+                        }
+                    },
+
+                    .ext_type => |e| {
+                        const b = try self.source.readByte();
+                        const ext_type: i8 = @bitCast(b);
+                        if (try self.startBlob(.extension, ext_type, e.len)) |obj| return obj;
+                    },
+
+                    .blob => |*b| {
+                        while (b.offset < b.data.len) {
+                            const available = self.source.readAvailable(b.data[b.offset..]);
+                            if (available == 0) {
+                                const byte = try self.source.readByte();
+                                b.data[b.offset] = byte;
+                                b.offset += 1;
+                            } else {
+                                b.offset += available;
+                            }
+                        }
+
+                        const data = b.data;
+                        const kind = b.kind;
+                        const ext_type = b.ext_type;
+                        self.state = .{ .tag = {} };
+
+                        const obj = switch (kind) {
+                            .string => MsgPackObject{ .string = data },
+                            .binary => MsgPackObject{ .binary = data },
+                            .extension => MsgPackObject{ .extension = .{ .type = ext_type, .data = data } },
+                        };
+
+                        if (try self.routeObject(obj)) |res| return res;
+                    },
+                }
+            }
         }
     };
 }
@@ -432,21 +579,32 @@ pub fn Parser(comptime Source: type) type {
 pub const Unpacker = struct {
     pub const Options = struct {
         max_buffer_size: usize = 1024 * 1024, // 1MB default
+        max_depth: usize = 128,
     };
 
     const Self = @This();
     allocator: std.mem.Allocator,
     ring: RingBuffer,
+    reader: RingReader,
+    parser: Parser(RingReader),
 
     pub fn init(allocator: std.mem.Allocator, options: Options) MsgPackError!Self {
-        const ring = try RingBuffer.init(allocator, .{ .max_buffer_size = options.max_buffer_size });
-        return Self{
+        var ring = try RingBuffer.init(allocator, .{ .max_buffer_size = options.max_buffer_size });
+        errdefer ring.deinit();
+
+        var self = Self{
             .allocator = allocator,
             .ring = ring,
+            .reader = .{ .ring = undefined },
+            .parser = undefined,
         };
+        self.reader.ring = &self.ring;
+        self.parser = Parser(RingReader).init(&self.reader, allocator, .{ .max_depth = options.max_depth });
+        return self;
     }
 
     pub fn deinit(self: *Self) void {
+        self.parser.deinit();
         self.ring.deinit();
     }
 
@@ -455,33 +613,30 @@ pub const Unpacker = struct {
     }
 
     pub fn next(self: *Self) MsgPackError!MsgPackObject {
-        if (self.ring.count == 0) {
+        if (self.ring.count == 0 and self.parser.isIdle()) {
             return MsgPackError.NoMessage;
         }
 
-        const saved_start = self.ring.start;
-        const saved_count = self.ring.count;
+        self.reader.ring = &self.ring;
+        self.parser.source = &self.reader;
 
-        var reader = RingReader{ .ring = &self.ring };
-        var parser = Parser(RingReader){ .source = &reader, .allocator = self.allocator };
-
-        return parser.parseObject() catch |err| switch (err) {
-            error.EndOfBuffer, error.Incomplete => {
-                self.ring.start = saved_start;
-                self.ring.count = saved_count;
-                return MsgPackError.Incomplete;
-            },
-            else => return err,
-        };
+        const maybe_obj = try self.parser.next();
+        if (maybe_obj) |obj| {
+            return obj;
+        } else {
+            return MsgPackError.Incomplete;
+        }
     }
 };
 
 pub fn unpack(allocator: std.mem.Allocator, buffer: []const u8) MsgPackError!MsgPackObject {
     if (buffer.len == 0) return MsgPackError.NoMessage;
     var reader = SliceReader{ .buffer = buffer, .pos = 0 };
-    var parser = Parser(SliceReader){ .source = &reader, .allocator = allocator };
+    var parser = Parser(SliceReader).init(&reader, allocator, .{});
+    defer parser.deinit();
     return parser.parseObject();
 }
+
 
 
 test "unpack command" {
@@ -1354,4 +1509,91 @@ test "unpack: complex array and map from contiguous slice" {
     try std.testing.expectEqualStrings("key", map_obj.map[0].key.string);
     try std.testing.expectEqual(@as(i64, 100), map_obj.map[0].value.integer);
 }
+
+// =========================================================================
+// Advanced Streaming State Machine Tests
+// =========================================================================
+
+test "Unpacker: 1-byte-at-a-time incremental streaming of complex structure" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 256 });
+    defer unpacker.deinit();
+
+    // Nested payload: [1, "hello", {"flag": true, "sub": [3.141592653589793, -42]}]
+    const packer_mod = @import("packer.zig");
+    var p = packer_mod.Packer.init(allocator);
+    defer p.deinit();
+
+    var s_hello = "hello".*;
+    var s_flag = "flag".*;
+    var s_sub = "sub".*;
+    var sub_arr = [_]MsgPackObject{
+        .{ .float64 = 3.141592653589793 },
+        .{ .integer = -42 },
+    };
+    var map_entries = [_]MsgPackMapEntry{
+        .{ .key = .{ .string = &s_flag }, .value = .{ .boolean = true } },
+        .{ .key = .{ .string = &s_sub }, .value = .{ .array = &sub_arr } },
+    };
+    var root_arr = [_]MsgPackObject{
+        .{ .integer = 1 },
+        .{ .string = &s_hello },
+        .{ .map = &map_entries },
+    };
+
+    try p.packObject(MsgPackObject{ .array = &root_arr });
+    const full_bytes = p.getSlice();
+
+    // Feed the bytes strictly 1 by 1 and call next() after each byte
+    for (full_bytes[0 .. full_bytes.len - 1]) |byte| {
+        try unpacker.feed(&[_]u8{byte});
+        try std.testing.expectError(error.Incomplete, unpacker.next());
+    }
+
+    // Feed the very last byte
+    try unpacker.feed(&[_]u8{full_bytes[full_bytes.len - 1]});
+    const obj = try unpacker.next();
+    defer freeObject(allocator, obj);
+
+    try std.testing.expect(obj == .array);
+    try std.testing.expectEqual(@as(usize, 3), obj.array.len);
+    try std.testing.expectEqual(@as(i64, 1), obj.array[0].integer);
+    try std.testing.expectEqualStrings("hello", obj.array[1].string);
+    try std.testing.expect(obj.array[2] == .map);
+    try std.testing.expectEqual(@as(usize, 2), obj.array[2].map.len);
+    try std.testing.expectEqualStrings("flag", obj.array[2].map[0].key.string);
+    try std.testing.expectEqual(true, obj.array[2].map[0].value.boolean);
+    try std.testing.expectEqualStrings("sub", obj.array[2].map[1].key.string);
+    try std.testing.expect(obj.array[2].map[1].value == .array);
+    try std.testing.expectEqual(@as(usize, 2), obj.array[2].map[1].value.array.len);
+    try std.testing.expectEqual(@as(f64, 3.141592653589793), obj.array[2].map[1].value.array[0].float64);
+    try std.testing.expectEqual(@as(i64, -42), obj.array[2].map[1].value.array[1].integer);
+
+    // End of buffer
+    try std.testing.expectError(error.NoMessage, unpacker.next());
+}
+
+test "Unpacker: deinit during incomplete parsing leaks zero memory" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 256 });
+
+    // Feed part of a map with an array and partial string: {"key": [1, 2, "partial_str...
+    try unpacker.feed("\x81\xa3key\x93\x01\x02\xa8part");
+    _ = unpacker.next() catch {};
+
+    // Deinit while partial objects are allocated in stack and blob state
+    unpacker.deinit();
+}
+
+test "Unpacker: max_depth security limit returns error and cleans up" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 256, .max_depth = 3 });
+    defer unpacker.deinit();
+
+    // 4 levels of nested arrays: [[[[1]]]]
+    try unpacker.feed("\x91\x91\x91\x91\x01");
+
+    try std.testing.expectError(error.MaxDepthExceeded, unpacker.next());
+}
+
 
