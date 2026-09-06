@@ -172,6 +172,15 @@ pub const SliceReader = zig_msgpack.SliceReader;
 pub const RingReader = zig_msgpack.RingReader;
 pub const Parser = zig_msgpack.Parser;
 
+pub const rpc = zig_msgpack.rpc;
+pub const RpcMessage = zig_msgpack.RpcMessage;
+pub const RpcMessageType = zig_msgpack.RpcMessageType;
+pub const RpcRequest = zig_msgpack.RpcRequest;
+pub const RpcResponse = zig_msgpack.RpcResponse;
+pub const RpcNotification = zig_msgpack.RpcNotification;
+pub const RpcSession = zig_msgpack.RpcSession;
+pub const RpcError = zig_msgpack.RpcError;
+
 test "roundtrip: nil and booleans" {
     const allocator = std.testing.allocator;
 

@@ -28,12 +28,22 @@ pub const SliceReader = unpacker.SliceReader;
 pub const RingReader = unpacker.RingReader;
 pub const Parser = unpacker.Parser;
 
+pub const rpc = @import("rpc.zig");
+pub const RpcMessage = rpc.Message;
+pub const RpcMessageType = rpc.MessageType;
+pub const RpcRequest = rpc.Request;
+pub const RpcResponse = rpc.Response;
+pub const RpcNotification = rpc.Notification;
+pub const RpcSession = rpc.Session;
+pub const RpcError = rpc.RpcError;
+
 test {
     std.testing.refAllDecls(@This());
     _ = ringbuffer;
     _ = types;
     _ = packer;
     _ = unpacker;
+    _ = rpc;
 }
 
 
