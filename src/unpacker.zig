@@ -15,6 +15,7 @@ pub const MsgPackError = error{
     NoMessage,
     UsedNeverUsed,
     MaxDepthExceeded,
+    ValueTooLarge,
     InvalidFormat,
 } || RingBufferError || std.mem.Allocator.Error;
 
@@ -135,6 +136,8 @@ pub fn Parser(comptime Source: type) type {
 
         pub const Options = struct {
             max_depth: usize = 128,
+            max_blob_bytes: usize = 16 * 1024 * 1024, // per string/binary/ext (16 MB)
+            max_container_len: usize = 1_000_000, // per array/map element count
         };
 
         source: *Source,
@@ -207,6 +210,10 @@ pub fn Parser(comptime Source: type) type {
         }
 
         fn startBlob(self: *Self, kind: BlobKind, ext_type: i8, len: usize) MsgPackError!?MsgPackObject {
+            if (len > self.options.max_blob_bytes) {
+                self.reset();
+                return MsgPackError.ValueTooLarge;
+            }
             if (len == 0) {
                 const empty_data = self.allocator.alloc(u8, 0) catch |err| {
                     self.reset();
@@ -241,6 +248,10 @@ pub fn Parser(comptime Source: type) type {
                 self.reset();
                 return MsgPackError.MaxDepthExceeded;
             }
+            if (len > self.options.max_container_len) {
+                self.reset();
+                return MsgPackError.ValueTooLarge;
+            }
 
             const array = self.allocator.alloc(MsgPackObject, len) catch |err| {
                 self.reset();
@@ -270,6 +281,10 @@ pub fn Parser(comptime Source: type) type {
             if (self.stack.items.len >= self.options.max_depth) {
                 self.reset();
                 return MsgPackError.MaxDepthExceeded;
+            }
+            if (len > self.options.max_container_len) {
+                self.reset();
+                return MsgPackError.ValueTooLarge;
             }
 
             const map = self.allocator.alloc(MsgPackMapEntry, len) catch |err| {
@@ -580,6 +595,8 @@ pub const Unpacker = struct {
     pub const Options = struct {
         max_buffer_size: usize = 1024 * 1024, // 1MB default
         max_depth: usize = 128,
+        max_blob_bytes: usize = 16 * 1024 * 1024,
+        max_container_len: usize = 1_000_000,
     };
 
     const Self = @This();
@@ -599,7 +616,11 @@ pub const Unpacker = struct {
             .parser = undefined,
         };
         self.reader.ring = &self.ring;
-        self.parser = Parser(RingReader).init(&self.reader, allocator, .{ .max_depth = options.max_depth });
+        self.parser = Parser(RingReader).init(&self.reader, allocator, .{
+            .max_depth = options.max_depth,
+            .max_blob_bytes = options.max_blob_bytes,
+            .max_container_len = options.max_container_len,
+        });
         return self;
     }
 
@@ -632,7 +653,11 @@ pub const Unpacker = struct {
 pub fn unpack(allocator: std.mem.Allocator, buffer: []const u8) MsgPackError!MsgPackObject {
     if (buffer.len == 0) return MsgPackError.NoMessage;
     var reader = SliceReader{ .buffer = buffer, .pos = 0 };
-    var parser = Parser(SliceReader).init(&reader, allocator, .{});
+    // A blob cannot meaningfully exceed the size of the input buffer, so use
+    // buffer.len as a tight upper bound rather than the global 16 MB default.
+    var parser = Parser(SliceReader).init(&reader, allocator, .{
+        .max_blob_bytes = buffer.len,
+    });
     defer parser.deinit();
     return parser.parseObject();
 }
@@ -1594,6 +1619,58 @@ test "Unpacker: max_depth security limit returns error and cleans up" {
     try unpacker.feed("\x91\x91\x91\x91\x01");
 
     try std.testing.expectError(error.MaxDepthExceeded, unpacker.next());
+}
+
+test "Unpacker: max_blob_bytes rejects oversized string" {
+    const allocator = std.testing.allocator;
+    // Limit blobs to 4 bytes; str8 claiming 5 bytes should be rejected.
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 256, .max_blob_bytes = 4 });
+    defer unpacker.deinit();
+
+    // str 8, length=5, "hello"
+    try unpacker.feed("\xd9\x05hello");
+    try std.testing.expectError(error.ValueTooLarge, unpacker.next());
+}
+
+test "Unpacker: max_blob_bytes rejects oversized binary" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 256, .max_blob_bytes = 2 });
+    defer unpacker.deinit();
+
+    // bin 8, length=3
+    try unpacker.feed("\xc4\x03\x01\x02\x03");
+    try std.testing.expectError(error.ValueTooLarge, unpacker.next());
+}
+
+test "Unpacker: max_container_len rejects oversized array" {
+    const allocator = std.testing.allocator;
+    // Limit containers to 2 elements; array16 claiming 3 should be rejected.
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 256, .max_container_len = 2 });
+    defer unpacker.deinit();
+
+    // array 16, length=3, elements [1, 2, 3]
+    try unpacker.feed("\xdc\x00\x03\x01\x02\x03");
+    try std.testing.expectError(error.ValueTooLarge, unpacker.next());
+}
+
+test "Unpacker: max_container_len rejects oversized map" {
+    const allocator = std.testing.allocator;
+    var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 256, .max_container_len = 1 });
+    defer unpacker.deinit();
+
+    // map 16, length=2: {"a":1, "b":2}
+    try unpacker.feed("\xde\x00\x02\xa1a\x01\xa1b\x02");
+    try std.testing.expectError(error.ValueTooLarge, unpacker.next());
+}
+
+test "unpack: max_blob_bytes auto-bounded to buffer length" {
+    const allocator = std.testing.allocator;
+
+    // str32 header claiming 100 bytes, but the buffer is only 6 bytes total.
+    // max_blob_bytes is set to buffer.len (6), so 100 > 6 fires ValueTooLarge
+    // before any allocation attempt rather than returning Incomplete.
+    const input = "\xdb\x00\x00\x00\x64x";
+    try std.testing.expectError(error.ValueTooLarge, unpack(allocator, input));
 }
 
 
