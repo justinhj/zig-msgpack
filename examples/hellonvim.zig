@@ -62,6 +62,25 @@ fn printObject(writer: anytype, obj: msgpack.MsgPackObject) anyerror!void {
     }
 }
 
+// Feed socket data into the unpacker until one complete object arrives.
+// Mirrors the pynvim _on_data pattern: try next(), and if more data is
+// needed read a chunk, feed it, then try again.
+fn readNextObject(fd: std.posix.fd_t, unpacker: *msgpack.Unpacker) !msgpack.MsgPackObject {
+    var read_buf: [4096]u8 = undefined;
+    while (true) {
+        const obj = unpacker.next() catch |err| switch (err) {
+            error.Incomplete, error.NoMessage => {
+                const n = std.c.read(fd, &read_buf, read_buf.len);
+                if (n <= 0) return error.ReadFailed;
+                try unpacker.feed(read_buf[0..@intCast(n)]);
+                continue;
+            },
+            else => return err,
+        };
+        return obj;
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
     const io = init.io;
@@ -112,6 +131,12 @@ pub fn main(init: std.process.Init) !void {
     var session = msgpack.RpcSession.init(arena);
     defer session.deinit();
 
+    // One unpacker for the lifetime of the connection. Responses arrive as a
+    // stream of bytes; readNextObject feeds chunks in and drains complete
+    // objects out, so fragmented or back-to-back messages are handled correctly.
+    var unpacker = try msgpack.Unpacker.init(arena, .{});
+    defer unpacker.deinit();
+
     // Call 1: Evaluate 2 + 2
     {
         var p = msgpack.Packer.init(arena);
@@ -133,11 +158,7 @@ pub fn main(init: std.process.Init) !void {
         const written = std.c.write(fd, p.getSlice().ptr, p.getSlice().len);
         if (written < 0) return error.WriteFailed;
 
-        var res_buf: [4096]u8 = undefined;
-        const n = std.c.read(fd, &res_buf, res_buf.len);
-        if (n <= 0) return error.ReadFailed;
-
-        const obj = try msgpack.unpack(arena, res_buf[0..@intCast(n)]);
+        const obj = try readNextObject(fd, &unpacker);
         defer msgpack.freeObject(arena, obj);
 
         const rpc_msg = try msgpack.rpc.parseMessage(obj);
@@ -184,11 +205,7 @@ pub fn main(init: std.process.Init) !void {
         const written = std.c.write(fd, p.getSlice().ptr, p.getSlice().len);
         if (written < 0) return error.WriteFailed;
 
-        var res_buf: [4096]u8 = undefined;
-        const n = std.c.read(fd, &res_buf, res_buf.len);
-        if (n <= 0) return error.ReadFailed;
-
-        const obj = try msgpack.unpack(arena, res_buf[0..@intCast(n)]);
+        const obj = try readNextObject(fd, &unpacker);
         defer msgpack.freeObject(arena, obj);
 
         const rpc_msg = try msgpack.rpc.parseMessage(obj);
@@ -235,11 +252,7 @@ pub fn main(init: std.process.Init) !void {
         const written = std.c.write(fd, p.getSlice().ptr, p.getSlice().len);
         if (written < 0) return error.WriteFailed;
 
-        var res_buf: [4096]u8 = undefined;
-        const n = std.c.read(fd, &res_buf, res_buf.len);
-        if (n <= 0) return error.ReadFailed;
-
-        const obj = try msgpack.unpack(arena, res_buf[0..@intCast(n)]);
+        const obj = try readNextObject(fd, &unpacker);
         defer msgpack.freeObject(arena, obj);
 
         const rpc_msg = try msgpack.rpc.parseMessage(obj);
