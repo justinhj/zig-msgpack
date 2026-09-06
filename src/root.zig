@@ -44,6 +44,7 @@ test {
     _ = packer;
     _ = unpacker;
     _ = rpc;
+    _ = @import("roundtrip_test.zig");
 }
 
 
