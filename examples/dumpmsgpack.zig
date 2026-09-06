@@ -123,7 +123,7 @@ pub fn main(init: std.process.Init) !void {
             \\Reads a MessagePack file, unpacks its contents, and pretty-prints it.
             \\
             \\Example:
-            \\  dumpmsgpack testdata/nvimapi.msgpack
+            \\  dumpmsgpack input.msgpack
             \\
         );
         try stdout_writer.flush();
