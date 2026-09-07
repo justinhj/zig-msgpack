@@ -1,6 +1,8 @@
 const std = @import("std");
 const types = @import("types.zig");
 const ringbuffer_mod = @import("ringbuffer.zig");
+const extension_registry = @import("extension_registry.zig");
+pub const AnyWriter = extension_registry.AnyWriter;
 
 pub const MsgPackObject = types.MsgPackObject;
 pub const MsgPackMapEntry = types.MsgPackMapEntry;
@@ -370,6 +372,14 @@ pub const Packer = struct {
 
     pub fn packRpcNotification(self: *Packer, method: []const u8, params: []const MsgPackObject) !void {
         return @import("packer.zig").packRpcNotification(self, method, params);
+    }
+
+    pub fn writer(self: *Packer) AnyWriter {
+        return AnyWriter.init(self, struct {
+            fn write(p: *Packer, bytes: []const u8) anyerror!void {
+                try p.writeAll(bytes);
+            }
+        }.write);
     }
 };
 

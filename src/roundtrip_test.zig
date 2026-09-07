@@ -223,3 +223,53 @@ test "roundtrip: Neovim RPC response" {
     try std.testing.expect(obj.array[2] == .nil); // error is nil
     try std.testing.expectEqualStrings("hello nvim", obj.array[3].string);
 }
+
+test "roundtrip: Extension timestamp 32, 64, 96 with ExtensionRegistry" {
+    const allocator = std.testing.allocator;
+
+    var registry = try root.ExtensionRegistry.initWithDefaults(allocator);
+    defer registry.deinit();
+
+    const handler = registry.get(-1).?;
+
+    const timestamps = [_]root.MsgPackTimestamp{
+        .{ .seconds = 1_700_000_000, .nanoseconds = 0 }, // 32-bit format
+        .{ .seconds = 1_700_000_000, .nanoseconds = 500_000_000 }, // 64-bit format
+        .{ .seconds = -123456, .nanoseconds = 987_654_321 }, // 96-bit format (negative)
+        .{ .seconds = (@as(i64, 1) << 35) + 100, .nanoseconds = 42 }, // 96-bit format (> 34 bits)
+    };
+
+    for (timestamps) |orig_ts| {
+        // Pack timestamp payload into a Packer
+        var payload_packer = Packer.init(allocator);
+        defer payload_packer.deinit();
+        try handler.packFn(payload_packer.writer(), &orig_ts);
+
+        // Pack as msgpack extension object
+        const ext_obj = MsgPackObject{
+            .extension = .{
+                .type = -1,
+                .data = @constCast(payload_packer.getSlice()),
+            },
+        };
+        const packed_bytes = try pack(allocator, ext_obj);
+        defer allocator.free(packed_bytes);
+
+        // Unpack msgpack object
+        const unpacked_obj = try unpack(allocator, packed_bytes);
+        defer freeObject(allocator, unpacked_obj);
+
+        try std.testing.expect(unpacked_obj == .extension);
+        try std.testing.expectEqual(@as(i8, -1), unpacked_obj.extension.type);
+
+        // Unpack timestamp via registry handler
+        const h = registry.get(unpacked_obj.extension.type).?;
+        const raw = try h.unpackFn(allocator, unpacked_obj.extension.data);
+        defer h.freeFn(allocator, raw);
+
+        const decoded_ts: *root.MsgPackTimestamp = @ptrCast(@alignCast(raw));
+        try std.testing.expectEqual(orig_ts.seconds, decoded_ts.seconds);
+        try std.testing.expectEqual(orig_ts.nanoseconds, decoded_ts.nanoseconds);
+    }
+}
+

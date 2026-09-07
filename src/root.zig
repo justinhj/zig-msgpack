@@ -37,6 +37,15 @@ pub const RpcNotification = rpc.Notification;
 pub const RpcSession = rpc.Session;
 pub const RpcError = rpc.RpcError;
 
+pub const timestamp_ext = @import("timestamp_ext.zig");
+pub const MsgPackTimestamp = timestamp_ext.MsgPackTimestamp;
+
+pub const extension_registry = @import("extension_registry.zig");
+pub const ExtensionRegistry = extension_registry.ExtensionRegistry;
+pub const ExtensionType = extension_registry.ExtensionType;
+pub const extHandlerFor = extension_registry.extHandlerFor;
+pub const AnyWriter = extension_registry.AnyWriter;
+
 test {
     std.testing.refAllDecls(@This());
     _ = ringbuffer;
@@ -44,6 +53,8 @@ test {
     _ = packer;
     _ = unpacker;
     _ = rpc;
+    _ = timestamp_ext;
+    _ = extension_registry;
     _ = @import("roundtrip_test.zig");
 }
 
