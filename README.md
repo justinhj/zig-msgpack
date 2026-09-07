@@ -35,7 +35,11 @@ exe.root_module.addImport("zig_msgpack", msgpack.module("zig_msgpack"));
   - Nested arrays and key-value maps
   - Extension types (fixext 1..16, ext 8..32)
 - One-shot deserialization (`msgpack.unpack`) and serialization (`msgpack.pack`)
-- Streaming unpacker (`msgpack.Unpacker`) backed by a ring buffer for incremental network or stream parsing
+- High-performance streaming unpacker (`msgpack.Unpacker`)
+  - True non-recursive state machine with explicit container frame stack
+  - $O(N)$ linear-time parsing across arbitrary chunk boundaries without re-parsing previously received data
+  - Memory-safe teardown: zero memory leaks when deinitializing midway through an incomplete message
+  - Configurable `max_depth` to protect against stack-overflow and DoS attacks from malicious deeply nested payloads
 - Flexible in-memory builder (`msgpack.Packer`) as well as direct `Writer` packing functions
 - MessagePack-RPC support (`msgpack.rpc`)
   - Request, response, and notification serialization
@@ -134,8 +138,13 @@ also accept any arbitrary Zig `Writer` directly.
 ### `msgpack.Unpacker` (Streaming)
 
 When reading data incrementally from a network socket or stream where messages arrive in chunks,
-`msgpack.Unpacker` buffers input in an internal ring buffer and yields objects as soon as complete
-messages are available:
+`msgpack.Unpacker` buffers input in an internal ring buffer and parses messages using a non-recursive
+state machine. It resumes parsing exactly where it left off on each subsequent chunk, guaranteeing $O(N)$
+linear performance without discarding or re-parsing previously received elements.
+
+`Unpacker.init` accepts options to configure buffer size and nesting security limits:
+- `max_buffer_size`: Internal ring buffer capacity (default: 1MB).
+- `max_depth`: Maximum container nesting depth allowed before returning `error.MaxDepthExceeded` (default: 128).
 
 ```zig
 pub fn main() !void {
@@ -143,7 +152,10 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var unpacker = try msgpack.Unpacker.init(allocator, .{});
+    var unpacker = try msgpack.Unpacker.init(allocator, .{
+        .max_buffer_size = 64 * 1024, // 64KB
+        .max_depth = 64,              // Limit recursion depth
+    });
     defer unpacker.deinit();
 
     // Feed chunks into unpacker as they arrive from socket/stream
@@ -155,7 +167,7 @@ pub fn main() !void {
         std.debug.print("Unpacked complete object: {}\n", .{@tagName(obj)});
     } else |err| switch (err) {
         error.NoMessage, error.Incomplete => {
-            // Need more data to form a complete object
+            // Need more data from socket/stream
         },
         else => return err,
     }
