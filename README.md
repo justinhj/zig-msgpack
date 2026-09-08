@@ -177,6 +177,42 @@ const msgpack = @import("zig_msgpack");
 const std = @import("std");
 ```
 
+#### Dual-Allocator Pattern & Arena Resetting (`nextAlloc`)
+
+For long-running loops (such as socket clients or daemon event loops), you can achieve maximum throughput and avoid memory fragmentation by using **two allocators**:
+1. A persistent general-purpose allocator (GPA) for the `Unpacker`'s internal ring buffer and parser infrastructure.
+2. A transient `std.heap.ArenaAllocator` passed to `unpacker.nextAlloc(arena.allocator())` to decode message trees.
+
+Calling `arena.reset(.retain_capacity)` at the end of each message cycle frees all message strings, arrays, and maps in $O(1)$ constant time without touching the stream buffer:
+
+```zig
+// Persistent stream buffer lives in GPA
+var unpacker = try msgpack.Unpacker.init(gpa, .{});
+defer unpacker.deinit();
+
+// Transient arena for message objects
+var cycle_arena = std.heap.ArenaAllocator.init(gpa);
+defer cycle_arena.deinit();
+
+while (connected) {
+    // Reset arena at the end of each iteration; .retain_capacity keeps memory
+    // pages warm and avoids OS syscalls in steady state
+    defer _ = cycle_arena.reset(.retain_capacity);
+    const alloc = cycle_arena.allocator();
+
+    // 1. Pack request using the arena
+    var packer = msgpack.Packer.init(alloc);
+    // ... pack and send ...
+
+    // 2. Unpack response directly into the arena
+    const obj = try unpacker.nextAlloc(alloc);
+    handleMessage(obj);
+
+    // No need to call msgpack.freeObject() or packer.deinit()!
+    // All message memory is wiped automatically in O(1) time.
+}
+```
+
 ### MessagePack-RPC
 
 `zig-msgpack` includes helpers and data structures for building MessagePack-RPC clients and
