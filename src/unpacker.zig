@@ -141,15 +141,17 @@ pub fn Parser(comptime Source: type) type {
         };
 
         source: *Source,
-        allocator: std.mem.Allocator,
+        buffer_allocator: std.mem.Allocator,
+        object_allocator: std.mem.Allocator,
         options: Options = .{},
         state: StepState = .{ .tag = {} },
         stack: std.ArrayListUnmanaged(ContainerFrame) = .empty,
 
-        pub fn init(source: *Source, allocator: std.mem.Allocator, options: Options) Self {
+        pub fn init(source: *Source, buffer_allocator: std.mem.Allocator, object_allocator: std.mem.Allocator, options: Options) Self {
             return .{
                 .source = source,
-                .allocator = allocator,
+                .buffer_allocator = buffer_allocator,
+                .object_allocator = object_allocator,
                 .options = options,
                 .state = .{ .tag = {} },
                 .stack = .empty,
@@ -158,7 +160,7 @@ pub fn Parser(comptime Source: type) type {
 
         pub fn deinit(self: *Self) void {
             self.reset();
-            self.stack.deinit(self.allocator);
+            self.stack.deinit(self.buffer_allocator);
         }
 
         pub fn isIdle(self: *const Self) bool {
@@ -168,7 +170,7 @@ pub fn Parser(comptime Source: type) type {
         pub fn reset(self: *Self) void {
             switch (self.state) {
                 .blob => |b| {
-                    self.allocator.free(b.data);
+                    self.object_allocator.free(b.data);
                 },
                 else => {},
             }
@@ -178,19 +180,19 @@ pub fn Parser(comptime Source: type) type {
                 switch (frame.kind) {
                     .array => {
                         for (frame.items.array[0..frame.count]) |item| {
-                            freeObject(self.allocator, item);
+                            freeObject(self.object_allocator, item);
                         }
-                        self.allocator.free(frame.items.array);
+                        self.object_allocator.free(frame.items.array);
                     },
                     .map_key, .map_val => {
                         for (frame.items.map.entries[0..frame.count]) |entry| {
-                            freeObject(self.allocator, entry.key);
-                            freeObject(self.allocator, entry.value);
+                            freeObject(self.object_allocator, entry.key);
+                            freeObject(self.object_allocator, entry.value);
                         }
                         if (frame.items.map.current_key) |k| {
-                            freeObject(self.allocator, k);
+                            freeObject(self.object_allocator, k);
                         }
-                        self.allocator.free(frame.items.map.entries);
+                        self.object_allocator.free(frame.items.map.entries);
                     },
                 }
             }
@@ -215,7 +217,7 @@ pub fn Parser(comptime Source: type) type {
                 return MsgPackError.ValueTooLarge;
             }
             if (len == 0) {
-                const empty_data = self.allocator.alloc(u8, 0) catch |err| {
+                const empty_data = self.object_allocator.alloc(u8, 0) catch |err| {
                     self.reset();
                     return err;
                 };
@@ -227,7 +229,7 @@ pub fn Parser(comptime Source: type) type {
                 return self.routeObject(obj);
             }
 
-            const data = self.allocator.alloc(u8, len) catch |err| {
+            const data = self.object_allocator.alloc(u8, len) catch |err| {
                 self.reset();
                 return err;
             };
@@ -253,7 +255,7 @@ pub fn Parser(comptime Source: type) type {
                 return MsgPackError.ValueTooLarge;
             }
 
-            const array = self.allocator.alloc(MsgPackObject, len) catch |err| {
+            const array = self.object_allocator.alloc(MsgPackObject, len) catch |err| {
                 self.reset();
                 return err;
             };
@@ -262,13 +264,13 @@ pub fn Parser(comptime Source: type) type {
                 return self.routeObject(MsgPackObject{ .array = array });
             }
 
-            self.stack.append(self.allocator, .{
+            self.stack.append(self.buffer_allocator, .{
                 .kind = .array,
                 .count = 0,
                 .total = len,
                 .items = .{ .array = array },
             }) catch |err| {
-                self.allocator.free(array);
+                self.object_allocator.free(array);
                 self.reset();
                 return err;
             };
@@ -287,7 +289,7 @@ pub fn Parser(comptime Source: type) type {
                 return MsgPackError.ValueTooLarge;
             }
 
-            const map = self.allocator.alloc(MsgPackMapEntry, len) catch |err| {
+            const map = self.object_allocator.alloc(MsgPackMapEntry, len) catch |err| {
                 self.reset();
                 return err;
             };
@@ -296,13 +298,13 @@ pub fn Parser(comptime Source: type) type {
                 return self.routeObject(MsgPackObject{ .map = map });
             }
 
-            self.stack.append(self.allocator, .{
+            self.stack.append(self.buffer_allocator, .{
                 .kind = .map_key,
                 .count = 0,
                 .total = len,
                 .items = .{ .map = .{ .entries = map, .current_key = null } },
             }) catch |err| {
-                self.allocator.free(map);
+                self.object_allocator.free(map);
                 self.reset();
                 return err;
             };
@@ -597,10 +599,12 @@ pub const Unpacker = struct {
         max_depth: usize = 128,
         max_blob_bytes: usize = 16 * 1024 * 1024,
         max_container_len: usize = 1_000_000,
+        object_allocator: ?std.mem.Allocator = null,
     };
 
     const Self = @This();
-    allocator: std.mem.Allocator,
+    buffer_allocator: std.mem.Allocator,
+    default_object_allocator: std.mem.Allocator,
     ring: RingBuffer,
     reader: RingReader,
     parser: Parser(RingReader),
@@ -609,14 +613,17 @@ pub const Unpacker = struct {
         var ring = try RingBuffer.init(allocator, .{ .max_buffer_size = options.max_buffer_size });
         errdefer ring.deinit();
 
+        const obj_alloc = options.object_allocator orelse allocator;
+
         var self = Self{
-            .allocator = allocator,
+            .buffer_allocator = allocator,
+            .default_object_allocator = obj_alloc,
             .ring = ring,
             .reader = .{ .ring = undefined },
             .parser = undefined,
         };
         self.reader.ring = &self.ring;
-        self.parser = Parser(RingReader).init(&self.reader, allocator, .{
+        self.parser = Parser(RingReader).init(&self.reader, allocator, obj_alloc, .{
             .max_depth = options.max_depth,
             .max_blob_bytes = options.max_blob_bytes,
             .max_container_len = options.max_container_len,
@@ -633,13 +640,18 @@ pub const Unpacker = struct {
         try self.ring.feed(data);
     }
 
-    pub fn next(self: *Self) MsgPackError!MsgPackObject {
+    pub fn isIdle(self: *const Self) bool {
+        return self.parser.isIdle();
+    }
+
+    pub fn nextAlloc(self: *Self, allocator: std.mem.Allocator) MsgPackError!MsgPackObject {
         if (self.ring.count == 0 and self.parser.isIdle()) {
             return MsgPackError.NoMessage;
         }
 
         self.reader.ring = &self.ring;
         self.parser.source = &self.reader;
+        self.parser.object_allocator = allocator;
 
         const maybe_obj = try self.parser.next();
         if (maybe_obj) |obj| {
@@ -648,6 +660,10 @@ pub const Unpacker = struct {
             return MsgPackError.Incomplete;
         }
     }
+
+    pub fn next(self: *Self) MsgPackError!MsgPackObject {
+        return self.nextAlloc(self.default_object_allocator);
+    }
 };
 
 pub fn unpack(allocator: std.mem.Allocator, buffer: []const u8) MsgPackError!MsgPackObject {
@@ -655,7 +671,7 @@ pub fn unpack(allocator: std.mem.Allocator, buffer: []const u8) MsgPackError!Msg
     var reader = SliceReader{ .buffer = buffer, .pos = 0 };
     // A blob cannot meaningfully exceed the size of the input buffer, so use
     // buffer.len as a tight upper bound rather than the global 16 MB default.
-    var parser = Parser(SliceReader).init(&reader, allocator, .{
+    var parser = Parser(SliceReader).init(&reader, allocator, allocator, .{
         .max_blob_bytes = buffer.len,
     });
     defer parser.deinit();
@@ -1672,5 +1688,61 @@ test "unpack: max_blob_bytes auto-bounded to buffer length" {
     const input = "\xdb\x00\x00\x00\x64x";
     try std.testing.expectError(error.ValueTooLarge, unpack(allocator, input));
 }
+
+test "Unpacker: dual-allocator nextAlloc with resetting ArenaAllocator in a loop" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    // Persistent unpacker using GPA for ring buffer and parser stack
+    var unpacker = try Unpacker.init(gpa, .{ .max_buffer_size = 1024 });
+    defer unpacker.deinit();
+
+    // Transient arena for decoded objects
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const iterations: usize = 100;
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        defer _ = arena.reset(.retain_capacity);
+        const arena_alloc = arena.allocator();
+
+        // Feed an array: ["hello loop", 42]
+        // \x92\xaahello loop\x2a
+        try unpacker.feed("\x92\xaahello loop\x2a");
+
+        const obj = try unpacker.nextAlloc(arena_alloc);
+
+        // Verify decoded object
+        try testing.expect(obj == .array);
+        try testing.expectEqual(@as(usize, 2), obj.array.len);
+        try testing.expectEqualStrings("hello loop", obj.array[0].string);
+        try testing.expectEqual(@as(i64, 42), obj.array[1].integer);
+
+        // Notice: NO freeObject() call needed!
+        // arena.reset(.retain_capacity) in defer reclaims all memory in O(1).
+    }
+}
+
+test "Unpacker: options.object_allocator configuration" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    var unpacker = try Unpacker.init(gpa, .{
+        .max_buffer_size = 512,
+        .object_allocator = arena.allocator(),
+    });
+    defer unpacker.deinit();
+
+    try unpacker.feed("\xa5world");
+    const obj = try unpacker.next();
+
+    try testing.expect(obj == .string);
+    try testing.expectEqualStrings("world", obj.string);
+}
+
 
 

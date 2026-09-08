@@ -63,12 +63,12 @@ fn printObject(writer: anytype, obj: msgpack.MsgPackObject) anyerror!void {
 }
 
 // Feed socket data into the unpacker until one complete object arrives.
-// Mirrors the pynvim _on_data pattern: try next(), and if more data is
+// Mirrors the pynvim _on_data pattern: try nextAlloc(allocator), and if more data is
 // needed read a chunk, feed it, then try again.
-fn readNextObject(fd: std.posix.fd_t, unpacker: *msgpack.Unpacker) !msgpack.MsgPackObject {
+fn readNextObject(fd: std.posix.fd_t, unpacker: *msgpack.Unpacker, allocator: std.mem.Allocator) !msgpack.MsgPackObject {
     var read_buf: [4096]u8 = undefined;
     while (true) {
-        const obj = unpacker.next() catch |err| switch (err) {
+        const obj = unpacker.nextAlloc(allocator) catch |err| switch (err) {
             error.Incomplete, error.NoMessage => {
                 const n = std.c.read(fd, &read_buf, read_buf.len);
                 if (n <= 0) return error.ReadFailed;
@@ -82,14 +82,15 @@ fn readNextObject(fd: std.posix.fd_t, unpacker: *msgpack.Unpacker) !msgpack.MsgP
 }
 
 pub fn main(init: std.process.Init) !void {
-    const arena: std.mem.Allocator = init.arena.allocator();
+    const gpa = init.gpa;
+    const process_arena = init.arena.allocator();
     const io = init.io;
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout_writer = &stdout_file_writer.interface;
 
-    const args = try init.minimal.args.toSlice(arena);
+    const args = try init.minimal.args.toSlice(process_arena);
     if (args.len < 2) {
         _ = try stdout_writer.write(
             \\Usage: hellonvim <path-to-nvim-unix-socket>
@@ -128,19 +129,27 @@ pub fn main(init: std.process.Init) !void {
     _ = try stdout_writer.write("\n\n");
     try stdout_writer.flush();
 
-    var session = msgpack.RpcSession.init(arena);
+    var session = msgpack.RpcSession.init(gpa);
     defer session.deinit();
 
-    // One unpacker for the lifetime of the connection. Responses arrive as a
-    // stream of bytes; readNextObject feeds chunks in and drains complete
-    // objects out, so fragmented or back-to-back messages are handled correctly.
-    var unpacker = try msgpack.Unpacker.init(arena, .{});
+    // Dual-allocator architecture:
+    // 1. Persistent connection infrastructure: The 1 MB ring buffer and parser
+    //    stack live in GPA for the lifetime of the connection.
+    var unpacker = try msgpack.Unpacker.init(gpa, .{});
     defer unpacker.deinit();
+
+    // 2. Transient per-cycle arena: Pack requests and unpack responses into
+    //    this arena, then call arena.reset(.retain_capacity) at the end of each
+    //    cycle to free all message objects in O(1) without leaking memory.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
 
     // Call 1: Evaluate 2 + 2
     {
-        var p = msgpack.Packer.init(arena);
-        defer p.deinit();
+        defer _ = arena.reset(.retain_capacity);
+        const alloc = arena.allocator();
+
+        var p = msgpack.Packer.init(alloc);
 
         var expr = "2 + 2".*;
         const params = [_]msgpack.MsgPackObject{
@@ -158,8 +167,9 @@ pub fn main(init: std.process.Init) !void {
         const written = std.c.write(fd, p.getSlice().ptr, p.getSlice().len);
         if (written < 0) return error.WriteFailed;
 
-        const obj = try readNextObject(fd, &unpacker);
-        defer msgpack.freeObject(arena, obj);
+        const obj = try readNextObject(fd, &unpacker, alloc);
+        // Note: No msgpack.freeObject() needed! arena.reset(.retain_capacity) in defer
+        // reclaims all request and response memory in O(1) time at the end of the block.
 
         const rpc_msg = try msgpack.rpc.parseMessage(obj);
         switch (rpc_msg) {
@@ -186,8 +196,10 @@ pub fn main(init: std.process.Init) !void {
 
     // Call 2: Greet Neovim and query version
     {
-        var p = msgpack.Packer.init(arena);
-        defer p.deinit();
+        defer _ = arena.reset(.retain_capacity);
+        const alloc = arena.allocator();
+
+        var p = msgpack.Packer.init(alloc);
 
         var expr = "'Hello from Zig! Running Neovim version ' . v:version".*;
         const params = [_]msgpack.MsgPackObject{
@@ -205,8 +217,7 @@ pub fn main(init: std.process.Init) !void {
         const written = std.c.write(fd, p.getSlice().ptr, p.getSlice().len);
         if (written < 0) return error.WriteFailed;
 
-        const obj = try readNextObject(fd, &unpacker);
-        defer msgpack.freeObject(arena, obj);
+        const obj = try readNextObject(fd, &unpacker, alloc);
 
         const rpc_msg = try msgpack.rpc.parseMessage(obj);
         switch (rpc_msg) {
@@ -233,8 +244,10 @@ pub fn main(init: std.process.Init) !void {
 
     // Call 3: Execute a command in Neovim
     {
-        var p = msgpack.Packer.init(arena);
-        defer p.deinit();
+        defer _ = arena.reset(.retain_capacity);
+        const alloc = arena.allocator();
+
+        var p = msgpack.Packer.init(alloc);
 
         var cmd = "let g:zig_msgpack_greeting = 'Greetings from zig-msgpack library!'".*;
         const params = [_]msgpack.MsgPackObject{
@@ -252,8 +265,7 @@ pub fn main(init: std.process.Init) !void {
         const written = std.c.write(fd, p.getSlice().ptr, p.getSlice().len);
         if (written < 0) return error.WriteFailed;
 
-        const obj = try readNextObject(fd, &unpacker);
-        defer msgpack.freeObject(arena, obj);
+        const obj = try readNextObject(fd, &unpacker, alloc);
 
         const rpc_msg = try msgpack.rpc.parseMessage(obj);
         switch (rpc_msg) {
