@@ -624,9 +624,9 @@ test "packer: extension format selection" {
     {
         var p = Packer.init(allocator);
         defer p.deinit();
-        const data16 = [_]u8{0x42} ** 16;
+        const data16 = @as([16]u8, @splat(@as(u8, 0x42)));
         try p.packExt(7, &data16);
-        try std.testing.expectEqualSlices(u8, "\xd8\x07" ++ ("\x42" ** 16), p.getSlice());
+        try std.testing.expectEqualSlices(u8, "\xd8\x07" ++ (@as([16]u8, @splat(@as(u8, '\x42')))), p.getSlice());
     }
 
     // ext 8: len 3 (not 1, 2, 4, 8, 16)

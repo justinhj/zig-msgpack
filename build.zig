@@ -30,12 +30,15 @@ pub fn build(b: *std.Build) void {
     var dumpmsgpack_exe: ?*std.Build.Step.Compile = null;
 
     for (examples) |example_name| {
+        // hellonvim calls std.c.read/write directly; 0.17 requires explicit libc linkage
+        const needs_libc = std.mem.eql(u8, example_name, "hellonvim");
         const example = b.addExecutable(.{
             .name = example_name,
             .root_module = b.createModule(.{
                 .root_source_file = b.path(b.fmt("examples/{s}.zig", .{example_name})),
                 .target = target,
                 .optimize = optimize,
+                .link_libc = needs_libc,
                 .imports = &.{
                     .{ .name = "zig_msgpack", .module = mod },
                 },
@@ -51,9 +54,7 @@ pub fn build(b: *std.Build) void {
         }
 
         const run_example = b.addRunArtifact(example);
-        if (b.args) |args| {
-            run_example.addArgs(args);
-        }
+        run_example.addPassthruArgs();
         const run_step = b.step(b.fmt("run-{s}", .{example_name}), b.fmt("Run the {s} example", .{example_name}));
         run_step.dependOn(&run_example.step);
     }
@@ -61,9 +62,7 @@ pub fn build(b: *std.Build) void {
     // Default "run" step executes dumpmsgpack for convenience
     if (dumpmsgpack_exe) |dump_exe| {
         const default_run = b.addRunArtifact(dump_exe);
-        if (b.args) |args| {
-            default_run.addArgs(args);
-        }
+        default_run.addPassthruArgs();
         const run_step = b.step("run", "Run the dumpmsgpack example");
         run_step.dependOn(&default_run.step);
     }

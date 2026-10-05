@@ -45,7 +45,7 @@ pub const SliceReader = struct {
         return n;
     }
 
-    pub fn readInt(self: *SliceReader, comptime T: type, endian: std.builtin.Endian) MsgPackError!T {
+    pub fn readInt(self: *SliceReader, comptime T: type, endian: std.lang.Endian) MsgPackError!T {
         const size = @sizeOf(T);
         if (self.pos + size > self.buffer.len) return MsgPackError.Incomplete;
         const val = std.mem.readInt(T, self.buffer[self.pos .. self.pos + size][0..size], endian);
@@ -78,7 +78,7 @@ pub const RingReader = struct {
         return n;
     }
 
-    pub fn readInt(self: *RingReader, comptime T: type, endian: std.builtin.Endian) MsgPackError!T {
+    pub fn readInt(self: *RingReader, comptime T: type, endian: std.lang.Endian) MsgPackError!T {
         const size = @sizeOf(T);
         var buf: [size]u8 = undefined;
         try self.readBytes(&buf);
@@ -739,7 +739,7 @@ test "Unpacker: overflow forwards NoRoomInBuffer" {
     var unpacker = try Unpacker.init(allocator, .{ .max_buffer_size = 10 });
     defer unpacker.deinit();
 
-    try std.testing.expectError(error.NoRoomInBuffer, unpacker.feed("A" ** 11));
+    try std.testing.expectError(error.NoRoomInBuffer, unpacker.feed(&@as([11]u8, @splat(@as(u8, 'A')))));
 }
 
 test "Unpacker.next: empty buffer returns NoMessage" {
@@ -1128,14 +1128,14 @@ test "Unpacker: str 8 (0xd9)" {
     defer unpacker.deinit();
 
     // 0xd9, length 32 (0x20), followed by 32 'X's (above fixstr limit of 31)
-    const payload = "X" ** 32;
+    const payload = @as([32]u8, @splat(@as(u8, 'X')));
     try unpacker.feed("\xd9\x20" ++ payload);
 
     const obj = try unpacker.next();
     defer freeObject(allocator, obj);
 
     try std.testing.expect(obj == .string);
-    try std.testing.expectEqualStrings(payload, obj.string);
+    try std.testing.expectEqualStrings(&payload, obj.string);
 }
 
 test "Unpacker: str 16 (0xda)" {
@@ -1144,14 +1144,14 @@ test "Unpacker: str 16 (0xda)" {
     defer unpacker.deinit();
 
     // 0xda, length 256 (0x0100), followed by 256 'Y's
-    const payload = "Y" ** 256;
+    const payload = @as([256]u8, @splat(@as(u8, 'Y')));
     try unpacker.feed("\xda\x01\x00" ++ payload);
 
     const obj = try unpacker.next();
     defer freeObject(allocator, obj);
 
     try std.testing.expect(obj == .string);
-    try std.testing.expectEqualStrings(payload, obj.string);
+    try std.testing.expectEqualStrings(&payload, obj.string);
 }
 
 test "Unpacker: str 32 (0xdb)" {
@@ -1222,7 +1222,7 @@ test "Unpacker: array 16 (0xdc)" {
     defer unpacker.deinit();
 
     // 0xdc, length 16 (0x0010, above fixarray limit of 15), 16 positive fixints 0x01
-    try unpacker.feed("\xdc\x00\x10" ++ ("\x01" ** 16));
+    try unpacker.feed("\xdc\x00\x10" ++ (@as([16]u8, @splat(@as(u8, '\x01')))));
 
     const obj = try unpacker.next();
     defer freeObject(allocator, obj);
@@ -1393,14 +1393,14 @@ test "Unpacker: fixext 16 (0xd8)" {
     defer unpacker.deinit();
 
     // 0xd8, type 0x05, data 16 bytes
-    try unpacker.feed("\xd8\x05" ++ ("\x42" ** 16));
+    try unpacker.feed("\xd8\x05" ++ (@as([16]u8, @splat(@as(u8, '\x42')))));
 
     const obj = try unpacker.next();
     defer freeObject(allocator, obj);
 
     try std.testing.expect(obj == .extension);
     try std.testing.expectEqual(@as(i8, 5), obj.extension.type);
-    try std.testing.expectEqualSlices(u8, "\x42" ** 16, obj.extension.data);
+    try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(@as(u8, '\x42'))), obj.extension.data);
 }
 
 test "Unpacker: ext 8 (0xc7)" {
