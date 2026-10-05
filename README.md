@@ -4,7 +4,7 @@ A simple and efficient MessagePack and MessagePack-RPC library for Zig.
 
 ## Installation
 
-`zig-msgpack` requires **Zig 0.16.0** or later.
+`zig-msgpack` requires **Zig 0.17.0** or later.
 
 Run `zig fetch` to add `zig-msgpack` to your `build.zig.zon`:
 

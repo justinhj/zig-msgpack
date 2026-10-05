@@ -142,18 +142,18 @@ test "RingBuffer.feed: partial and sequential feeds without wrap" {
     defer rb.deinit();
 
     // First chunk: 40 bytes
-    const chunk1 = "A" ** 40;
-    try rb.feed(chunk1);
+    const chunk1 = @as([40]u8, @splat(@as(u8, 'A')));
+    try rb.feed(&chunk1);
     try std.testing.expectEqual(@as(usize, 40), rb.count);
     try std.testing.expectEqual(@as(usize, 40), rb.end);
-    try std.testing.expectEqualSlices(u8, chunk1, rb.buffer[0..40]);
+    try std.testing.expectEqualSlices(u8, &chunk1, rb.buffer[0..40]);
 
     // Second chunk: 50 bytes (total 90 bytes)
-    const chunk2 = "B" ** 50;
-    try rb.feed(chunk2);
+    const chunk2 = @as([50]u8, @splat(@as(u8, 'B')));
+    try rb.feed(&chunk2);
     try std.testing.expectEqual(@as(usize, 90), rb.count);
     try std.testing.expectEqual(@as(usize, 90), rb.end);
-    try std.testing.expectEqualSlices(u8, chunk2, rb.buffer[40..90]);
+    try std.testing.expectEqualSlices(u8, &chunk2, rb.buffer[40..90]);
 }
 
 test "RingBuffer.feed: exact full capacity (128 bytes)" {
@@ -161,11 +161,11 @@ test "RingBuffer.feed: exact full capacity (128 bytes)" {
     var rb = try RingBuffer.init(allocator, .{ .max_buffer_size = 128 });
     defer rb.deinit();
 
-    const full_data = "X" ** 128;
-    try rb.feed(full_data);
+    const full_data = @as([128]u8, @splat(@as(u8, 'X')));
+    try rb.feed(&full_data);
 
     try std.testing.expectEqual(@as(usize, 128), rb.count);
-    try std.testing.expectEqualSlices(u8, full_data, rb.buffer[0..128]);
+    try std.testing.expectEqualSlices(u8, &full_data, rb.buffer[0..128]);
 }
 
 test "RingBuffer.feed: overflow on empty buffer (> 128 bytes)" {
@@ -173,8 +173,8 @@ test "RingBuffer.feed: overflow on empty buffer (> 128 bytes)" {
     var rb = try RingBuffer.init(allocator, .{ .max_buffer_size = 128 });
     defer rb.deinit();
 
-    const too_large = "Z" ** 129;
-    try std.testing.expectError(error.NoRoomInBuffer, rb.feed(too_large));
+    const too_large = @as([129]u8, @splat(@as(u8, 'Z')));
+    try std.testing.expectError(error.NoRoomInBuffer, rb.feed(&too_large));
 
     // State should remain unchanged
     try std.testing.expectEqual(@as(usize, 0), rb.count);
@@ -187,11 +187,11 @@ test "RingBuffer.feed: overflow on partially full buffer" {
     defer rb.deinit();
 
     // Fill 100 bytes
-    try rb.feed("A" ** 100);
+    try rb.feed(&@as([100]u8, @splat(@as(u8, 'A'))));
     try std.testing.expectEqual(@as(usize, 100), rb.count);
 
     // Attempt to feed 29 bytes (100 + 29 = 129 > 128)
-    try std.testing.expectError(error.NoRoomInBuffer, rb.feed("B" ** 29));
+    try std.testing.expectError(error.NoRoomInBuffer, rb.feed(&@as([29]u8, @splat(@as(u8, 'B')))));
 
     // State should remain unchanged from before the failed feed
     try std.testing.expectEqual(@as(usize, 100), rb.count);
@@ -203,7 +203,7 @@ test "RingBuffer.feed: feeding when completely full" {
     var rb = try RingBuffer.init(allocator, .{ .max_buffer_size = 128 });
     defer rb.deinit();
 
-    try rb.feed("A" ** 128);
+    try rb.feed(&@as([128]u8, @splat(@as(u8, 'A'))));
     try std.testing.expectEqual(@as(usize, 128), rb.count);
 
     // Even a single byte should fail
@@ -223,15 +223,15 @@ test "RingBuffer.feed: wrap-around across buffer boundary" {
     rb.count = 0;
 
     // Feed 50 bytes: 28 bytes fit at [100..128], 22 bytes wrap to [0..22]
-    const data = ("A" ** 28) ++ ("B" ** 22);
-    try rb.feed(data);
+    const data = (@as([28]u8, @splat(@as(u8, 'A')))) ++ (@as([22]u8, @splat(@as(u8, 'B'))));
+    try rb.feed(&data);
 
     try std.testing.expectEqual(@as(usize, 50), rb.count);
     try std.testing.expectEqual(@as(usize, 22), rb.end);
 
     // Verify both contiguous halves
-    try std.testing.expectEqualSlices(u8, "A" ** 28, rb.buffer[100..128]);
-    try std.testing.expectEqualSlices(u8, "B" ** 22, rb.buffer[0..22]);
+    try std.testing.expectEqualSlices(u8, &@as([28]u8, @splat(@as(u8, 'A'))), rb.buffer[100..128]);
+    try std.testing.expectEqualSlices(u8, &@as([22]u8, @splat(@as(u8, 'B'))), rb.buffer[0..22]);
 }
 
 test "RingBuffer.feed: wrap-around landing exactly at boundary (end == 128 wraps to 0)" {
@@ -245,12 +245,12 @@ test "RingBuffer.feed: wrap-around landing exactly at boundary (end == 128 wraps
     rb.count = 0;
 
     // Exactly 28 bytes to reach index 128
-    const data = "C" ** 28;
-    try rb.feed(data);
+    const data = @as([28]u8, @splat(@as(u8, 'C')));
+    try rb.feed(&data);
 
     try std.testing.expectEqual(@as(usize, 28), rb.count);
     try std.testing.expectEqual(@as(usize, 0), rb.end);
-    try std.testing.expectEqualSlices(u8, data, rb.buffer[100..128]);
+    try std.testing.expectEqualSlices(u8, &data, rb.buffer[100..128]);
 }
 
 test "RingBuffer.init: zero-sized buffer returns InvalidBufferSize" {
@@ -264,27 +264,27 @@ test "RingBuffer.feed: multiple successive wraps" {
     defer rb.deinit();
 
     // Cycle 1: Fill 100, simulate consuming 100
-    try rb.feed("A" ** 100);
+    try rb.feed(&@as([100]u8, @splat(@as(u8, 'A'))));
     rb.start = 100;
     rb.count = 0;
 
     // Wrap 1: 50 bytes (28 at end [100..128], 22 at start [0..22])
-    try rb.feed("B" ** 50);
+    try rb.feed(&@as([50]u8, @splat(@as(u8, 'B'))));
     try std.testing.expectEqual(@as(usize, 22), rb.end);
     try std.testing.expectEqual(@as(usize, 50), rb.count);
-    try std.testing.expectEqualSlices(u8, "B" ** 28, rb.buffer[100..128]);
-    try std.testing.expectEqualSlices(u8, "B" ** 22, rb.buffer[0..22]);
+    try std.testing.expectEqualSlices(u8, &@as([28]u8, @splat(@as(u8, 'B'))), rb.buffer[100..128]);
+    try std.testing.expectEqualSlices(u8, &@as([22]u8, @splat(@as(u8, 'B'))), rb.buffer[0..22]);
 
     // Simulate consuming 50 bytes
     rb.start = 22;
     rb.count = 0;
 
     // Wrap 2: 120 bytes from offset 22 (106 at end [22..128], 14 at start [0..14])
-    try rb.feed("C" ** 120);
+    try rb.feed(&@as([120]u8, @splat(@as(u8, 'C'))));
     try std.testing.expectEqual(@as(usize, 14), rb.end);
     try std.testing.expectEqual(@as(usize, 120), rb.count);
-    try std.testing.expectEqualSlices(u8, "C" ** 106, rb.buffer[22..128]);
-    try std.testing.expectEqualSlices(u8, "C" ** 14, rb.buffer[0..14]);
+    try std.testing.expectEqualSlices(u8, &@as([106]u8, @splat(@as(u8, 'C'))), rb.buffer[22..128]);
+    try std.testing.expectEqualSlices(u8, &@as([14]u8, @splat(@as(u8, 'C'))), rb.buffer[0..14]);
 }
 
 test "RingBuffer.feed: byte-by-byte until full" {
@@ -394,7 +394,7 @@ test "RingBuffer: interleaved feed and get reclaiming buffer space" {
     defer rb.deinit();
 
     // Feed 100 bytes
-    try rb.feed("A" ** 100);
+    try rb.feed(&@as([100]u8, @splat(@as(u8, 'A'))));
     try std.testing.expectEqual(@as(usize, 100), rb.count);
 
     // Consume 50 bytes
@@ -405,7 +405,7 @@ test "RingBuffer: interleaved feed and get reclaiming buffer space" {
 
     // Feed 60 more bytes (100 - 50 + 60 = 110 <= 128)
     // This succeeds because count was properly decremented
-    try rb.feed("B" ** 60);
+    try rb.feed(&@as([60]u8, @splat(@as(u8, 'B'))));
     try std.testing.expectEqual(@as(usize, 110), rb.count);
 
     // Consume the remaining 50 'A's
