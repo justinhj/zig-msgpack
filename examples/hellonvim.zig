@@ -70,9 +70,10 @@ fn readNextObject(fd: std.posix.fd_t, unpacker: *msgpack.Unpacker, allocator: st
     while (true) {
         const obj = unpacker.nextAlloc(allocator) catch |err| switch (err) {
             error.Incomplete, error.NoMessage => {
-                const n = std.c.read(fd, &read_buf, read_buf.len);
-                if (n <= 0) return error.ReadFailed;
-                try unpacker.feed(read_buf[0..@intCast(n)]);
+                // Single read syscall; returns bytes available (no libc).
+                const n = std.posix.read(fd, &read_buf) catch return error.ReadFailed;
+                if (n == 0) return error.ReadFailed; // EOF
+                try unpacker.feed(read_buf[0..n]);
                 continue;
             },
             else => return err,
@@ -123,6 +124,9 @@ pub fn main(init: std.process.Init) !void {
     defer stream.close(io);
 
     const fd = stream.socket.handle;
+    var sock_buf: [4096]u8 = undefined;
+    var sock_writer = stream.writer(io, &sock_buf);
+    const sock_out = &sock_writer.interface;
 
     _ = try stdout_writer.write("Successfully connected to Neovim at: ");
     _ = try stdout_writer.write(socket_path);
@@ -164,8 +168,8 @@ pub fn main(init: std.process.Init) !void {
         _ = try stdout_writer.write(" method=\"nvim_eval\" params=[\"2 + 2\"]\n");
         try stdout_writer.flush();
 
-        const written = std.c.write(fd, p.getSlice().ptr, p.getSlice().len);
-        if (written < 0) return error.WriteFailed;
+        try sock_out.writeAll(p.getSlice());
+        try sock_out.flush();
 
         const obj = try readNextObject(fd, &unpacker, alloc);
         // Note: No msgpack.freeObject() needed! arena.reset(.retain_capacity) in defer
@@ -214,8 +218,8 @@ pub fn main(init: std.process.Init) !void {
         _ = try stdout_writer.write(" method=\"nvim_eval\" params=[\"'Hello from Zig! ...'\"]\n");
         try stdout_writer.flush();
 
-        const written = std.c.write(fd, p.getSlice().ptr, p.getSlice().len);
-        if (written < 0) return error.WriteFailed;
+        try sock_out.writeAll(p.getSlice());
+        try sock_out.flush();
 
         const obj = try readNextObject(fd, &unpacker, alloc);
 
@@ -262,8 +266,8 @@ pub fn main(init: std.process.Init) !void {
         _ = try stdout_writer.write(" method=\"nvim_command\" params=[\"let g:zig_msgpack_greeting = ...\"]\n");
         try stdout_writer.flush();
 
-        const written = std.c.write(fd, p.getSlice().ptr, p.getSlice().len);
-        if (written < 0) return error.WriteFailed;
+        try sock_out.writeAll(p.getSlice());
+        try sock_out.flush();
 
         const obj = try readNextObject(fd, &unpacker, alloc);
 

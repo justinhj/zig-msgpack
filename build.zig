@@ -51,9 +51,7 @@ pub fn build(b: *std.Build) void {
         }
 
         const run_example = b.addRunArtifact(example);
-        if (b.args) |args| {
-            run_example.addArgs(args);
-        }
+        run_example.addPassthruArgs();
         const run_step = b.step(b.fmt("run-{s}", .{example_name}), b.fmt("Run the {s} example", .{example_name}));
         run_step.dependOn(&run_example.step);
     }
@@ -61,9 +59,7 @@ pub fn build(b: *std.Build) void {
     // Default "run" step executes dumpmsgpack for convenience
     if (dumpmsgpack_exe) |dump_exe| {
         const default_run = b.addRunArtifact(dump_exe);
-        if (b.args) |args| {
-            default_run.addArgs(args);
-        }
+        default_run.addPassthruArgs();
         const run_step = b.step("run", "Run the dumpmsgpack example");
         run_step.dependOn(&default_run.step);
     }
