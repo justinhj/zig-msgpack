@@ -65,15 +65,16 @@ fn printObject(writer: anytype, obj: msgpack.MsgPackObject) anyerror!void {
 // Feed socket data into the unpacker until one complete object arrives.
 // Mirrors the pynvim _on_data pattern: try nextAlloc(allocator), and if more data is
 // needed read a chunk, feed it, then try again.
-fn readNextObject(fd: std.posix.fd_t, unpacker: *msgpack.Unpacker, allocator: std.mem.Allocator) !msgpack.MsgPackObject {
-    var read_buf: [4096]u8 = undefined;
+fn readNextObject(reader: *Io.Reader, unpacker: *msgpack.Unpacker, allocator: std.mem.Allocator) !msgpack.MsgPackObject {
     while (true) {
         const obj = unpacker.nextAlloc(allocator) catch |err| switch (err) {
             error.Incomplete, error.NoMessage => {
-                // Single read syscall; returns bytes available (no libc).
-                const n = std.posix.read(fd, &read_buf) catch return error.ReadFailed;
-                if (n == 0) return error.ReadFailed; // EOF
-                try unpacker.feed(read_buf[0..n]);
+                const chunk = reader.peekGreedy(1) catch |read_err| switch (read_err) {
+                    error.EndOfStream => return error.ReadFailed,
+                    else => return error.ReadFailed,
+                };
+                try unpacker.feed(chunk);
+                reader.toss(chunk.len);
                 continue;
             },
             else => return err,
@@ -123,10 +124,13 @@ pub fn main(init: std.process.Init) !void {
     };
     defer stream.close(io);
 
-    const fd = stream.socket.handle;
-    var sock_buf: [4096]u8 = undefined;
-    var sock_writer = stream.writer(io, &sock_buf);
+    var sock_write_buf: [4096]u8 = undefined;
+    var sock_writer = stream.writer(io, &sock_write_buf);
     const sock_out = &sock_writer.interface;
+
+    var sock_read_buf: [4096]u8 = undefined;
+    var sock_reader = stream.reader(io, &sock_read_buf);
+    const sock_in = &sock_reader.interface;
 
     _ = try stdout_writer.write("Successfully connected to Neovim at: ");
     _ = try stdout_writer.write(socket_path);
@@ -171,7 +175,7 @@ pub fn main(init: std.process.Init) !void {
         try sock_out.writeAll(p.getSlice());
         try sock_out.flush();
 
-        const obj = try readNextObject(fd, &unpacker, alloc);
+        const obj = try readNextObject(sock_in, &unpacker, alloc);
         // Note: No msgpack.freeObject() needed! arena.reset(.retain_capacity) in defer
         // reclaims all request and response memory in O(1) time at the end of the block.
 
@@ -221,7 +225,7 @@ pub fn main(init: std.process.Init) !void {
         try sock_out.writeAll(p.getSlice());
         try sock_out.flush();
 
-        const obj = try readNextObject(fd, &unpacker, alloc);
+        const obj = try readNextObject(sock_in, &unpacker, alloc);
 
         const rpc_msg = try msgpack.rpc.parseMessage(obj);
         switch (rpc_msg) {
@@ -269,7 +273,7 @@ pub fn main(init: std.process.Init) !void {
         try sock_out.writeAll(p.getSlice());
         try sock_out.flush();
 
-        const obj = try readNextObject(fd, &unpacker, alloc);
+        const obj = try readNextObject(sock_in, &unpacker, alloc);
 
         const rpc_msg = try msgpack.rpc.parseMessage(obj);
         switch (rpc_msg) {
