@@ -28,3 +28,6 @@ jobs:
 
       - name: Test
         run: zig build test
+
+      - name: Build bench (compile check)
+        run: zig build bench
